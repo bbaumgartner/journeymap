@@ -44,7 +44,11 @@ TRAVEL_FRAMES_MIN = 18
 TRAVEL_FRAMES_MAX = 48
 PATH_SAMPLES = 64
 PATH_COLOR = (0, 130, 210)
+# World-space tube radius at PATH_REF_DISTANCE; scaled with zoom for constant screen width.
 PATH_RADIUS = 0.0007
+PATH_REF_DISTANCE = 1.12
+PATH_RADIUS_MIN = 0.00008
+PATH_RADIUS_MAX = 0.0025
 EARTH_RADIUS = 1.0
 TILE_RADIUS = 1.0015
 PATH_RADIUS_R = 1.003
@@ -54,8 +58,12 @@ PATH_ARCH_PER_DEG = 0.001
 PATH_ARCH_MAX = 0.08
 # Camera distance from Earth centre (larger = farther / zoomed out).
 CAM_DIST_WIDE = 3.6
-CAM_DIST_CLOSE_MIN = 1.10
+CAM_DIST_CLOSE_MIN = 1.03
 CAM_DIST_CLOSE_MAX = 1.28
+# Frame each leg so its angular span fills ~1/margin of the viewport.
+CLOSE_SPAN_MARGIN = 5.0
+# Never tighter than this FOV diameter (keeps sub-0.1° GPS jitter usable).
+CLOSE_MIN_FOV_DEG = 1.2
 # Overview zoom: frame the journey mosaic tightly (not a full-globe pullback).
 OVERVIEW_FRAME_MARGIN = 1.08
 OVERVIEW_MIN_HALF_DEG = 1.8
@@ -71,6 +79,9 @@ WORLD_EQUIRECT_WIDTH = 2048
 WORLD_EQUIRECT_HEIGHT = 1024
 # Journey mosaic stays up through the route-overview outro.
 DETAIL_DIST_MAX = 3.0
+# When closer than this, drape a local high-z mosaic over the journey tiles.
+LOCAL_DETAIL_MAX_DIST = 1.12
+LOCAL_DETAIL_RADIUS = 1.0028
 # Padding around the journey bbox when building the fixed detail mosaic.
 JOURNEY_PAD_DEG = 1.2
 JOURNEY_PAD_FRAC = 0.45
@@ -128,13 +139,26 @@ def journey_span_deg(positions: list[Position]) -> float:
     return span
 
 
+def close_camera_distance_for_span(span_deg: float) -> float:
+    """Camera distance that frames ``span_deg`` with margin (closer for short hops)."""
+    fov = max(CLOSE_MIN_FOV_DEG, max(0.0, span_deg) * CLOSE_SPAN_MARGIN)
+    half_deg = fov / 2.0
+    # Past ~half the camera VFOV the altitude model blows up; use the far clamp.
+    half_cap = CAMERA_VFOV_DEG / 2.0 * 0.98
+    if half_deg >= half_cap:
+        return CAM_DIST_CLOSE_MAX
+    half_rad = math.radians(half_deg)
+    half_vfov = math.radians(CAMERA_VFOV_DEG / 2.0)
+    altitude = math.tan(half_rad) / math.tan(half_vfov)
+    dist = EARTH_RADIUS + altitude
+    return max(CAM_DIST_CLOSE_MIN, min(CAM_DIST_CLOSE_MAX, dist))
+
+
 def close_camera_distance(positions: list[Position]) -> float:
-    """Closer for short regional spans, slightly farther for long journeys."""
+    """Journey-wide close distance (overview floor / single-stop fallback)."""
     if len(positions) < 2:
         return CAM_DIST_CLOSE_MIN
-    span = journey_span_deg(positions)
-    t = min(1.0, max(0.0, (span - 5.0) / 35.0))
-    return CAM_DIST_CLOSE_MIN + t * (CAM_DIST_CLOSE_MAX - CAM_DIST_CLOSE_MIN)
+    return close_camera_distance_for_span(journey_span_deg(positions))
 
 
 def journey_bbox_deg(positions: list[Position]) -> tuple[float, float, float, float]:
@@ -181,10 +205,19 @@ def overview_camera_distance(positions: list[Position]) -> float:
     return dist
 
 
+def path_tube_radius(distance: float) -> float:
+    """World-space tube radius that keeps on-screen path width roughly constant."""
+    cam_to_surface = max(0.02, distance - EARTH_RADIUS)
+    ref_cam = max(0.02, PATH_REF_DISTANCE - EARTH_RADIUS)
+    radius = PATH_RADIUS * (cam_to_surface / ref_cam)
+    return max(PATH_RADIUS_MIN, min(PATH_RADIUS_MAX, radius))
+
+
 def path_width_px(distance: float, img_h: int = IMG_HEIGHT) -> float:
     """Approximate on-screen width of the path tube in output pixels."""
-    cam_to_surface = max(0.05, distance - EARTH_RADIUS)
-    return (2.0 * PATH_RADIUS / cam_to_surface) * (img_h / 2.0) / math.tan(
+    cam_to_surface = max(0.02, distance - EARTH_RADIUS)
+    radius = path_tube_radius(distance)
+    return (2.0 * radius / cam_to_surface) * (img_h / 2.0) / math.tan(
         math.radians(CAMERA_VFOV_DEG / 2.0)
     )
 
@@ -376,7 +409,7 @@ def view_half_angle_deg(distance: float, vfov_deg: float = CAMERA_VFOV_DEG) -> f
     altitude = max(0.001, distance - EARTH_RADIUS)
     half = math.degrees(math.atan(math.tan(math.radians(vfov_deg / 2.0)) * altitude))
     limb = math.degrees(math.asin(min(1.0, EARTH_RADIUS / max(distance, 1.001))))
-    return max(1.5, min(half * 1.2, limb))
+    return max(0.15, min(half * 1.2, limb))
 
 
 def osm_zoom_for_distance(distance: float) -> int:
@@ -645,6 +678,7 @@ def _region_patch_mesh(
     y0: int,
     y1: int,
     subdivisions: int = 48,
+    radius: float = TILE_RADIUS,
 ) -> tuple[pv.PolyData, pv.Texture]:
     """Textured patch for an OSM mosaic; vertices follow Web Mercator, not linear lat.
 
@@ -670,7 +704,7 @@ def _region_patch_mesh(
         lat = mercator_y_norm_to_lat(float(y_norm))
         for iu, lng in enumerate(lngs):
             wrapped = ((lng + 180) % 360) - 180
-            points.append(ll_to_xyz(lat, wrapped, TILE_RADIUS))
+            points.append(ll_to_xyz(lat, wrapped, radius))
             # Image row 0 is north; VTK V=1 samples first row.
             uvs.append([iu / (nu - 1), 1.0 - t])
     points_a = np.asarray(points, dtype=np.float64)
@@ -777,8 +811,13 @@ class GlobeRenderer:
         self._detail_actor = None
         self._detail_ready = False
         self._detail_visible = False
+        self._journey_z = TILE_ZOOM_MIN
+        self._local_actor = None
+        self._local_key: tuple[int, int, int, int, int] | None = None
+        self._local_visible = False
         self._path_actor = None
         self._last_path_len = -1
+        self._last_path_radius_key = -1.0
         # Disable default lighting extremes for a flatter map look.
         self._plotter.remove_all_lights()
         light = pv.Light(position=(5, 5, 5), light_type="scene light")
@@ -796,6 +835,7 @@ class GlobeRenderer:
 
     def prepare_journey_detail(self, positions: list[Position]) -> None:
         """Build one fixed OSM mosaic for the journey (no per-frame rebuilds)."""
+        self._clear_local_detail()
         if self._detail_actor is not None:
             self._plotter.remove_actor(self._detail_actor, render=False)
             self._detail_actor = None
@@ -804,6 +844,7 @@ class GlobeRenderer:
         tiles = tiles_for_journey(positions)
         if not tiles:
             return
+        self._journey_z = tiles[0][0]
         mosaic = _mosaic_from_tiles(tiles, self.tile_fetcher)
         if mosaic is None:
             return
@@ -821,9 +862,70 @@ class GlobeRenderer:
         self._detail_actor.SetVisibility(False)
         self._detail_ready = True
 
+    def _clear_local_detail(self) -> None:
+        if self._local_actor is not None:
+            self._plotter.remove_actor(self._local_actor, render=False)
+            self._local_actor = None
+        self._local_key = None
+        self._local_visible = False
+
+    def _set_local_visible(self, visible: bool) -> None:
+        if self._local_actor is None:
+            self._local_visible = False
+            return
+        if visible == self._local_visible:
+            return
+        self._local_actor.SetVisibility(visible)
+        self._local_visible = visible
+
+    def _maybe_update_local_detail(
+        self, focus_lat: float, focus_lng: float, distance: float
+    ) -> None:
+        """Drape a sharper local mosaic when the camera is closer than the journey tiles."""
+        if distance > LOCAL_DETAIL_MAX_DIST:
+            self._set_local_visible(False)
+            return
+        tiles = visible_tiles(focus_lat, focus_lng, distance)
+        if not tiles:
+            self._set_local_visible(False)
+            return
+        z = tiles[0][0]
+        if z <= self._journey_z:
+            self._set_local_visible(False)
+            return
+        xs = [t[1] for t in tiles]
+        ys = [t[2] for t in tiles]
+        key = (z, min(xs), max(xs), min(ys), max(ys))
+        if key == self._local_key and self._local_actor is not None:
+            self._set_local_visible(True)
+            return
+        mosaic = _mosaic_from_tiles(tiles, self.tile_fetcher)
+        if mosaic is None:
+            self._set_local_visible(False)
+            return
+        img, mz, x0, x1, y0, y1 = mosaic
+        mesh, tex = _region_patch_mesh(
+            img, mz, x0, x1, y0, y1, radius=LOCAL_DETAIL_RADIUS
+        )
+        if self._local_actor is not None:
+            self._plotter.remove_actor(self._local_actor, render=False)
+        self._local_actor = self._plotter.add_mesh(
+            mesh,
+            texture=tex,
+            smooth_shading=True,
+            show_edges=False,
+            ambient=1.0,
+            diffuse=0.0,
+            specular=0.0,
+        )
+        self._local_key = key
+        self._local_visible = True
+
     def _set_detail_visible(self, visible: bool) -> None:
         if not self._detail_ready or self._detail_actor is None:
             self._sphere_actor.SetVisibility(True)
+            if not visible:
+                self._set_local_visible(False)
             return
         if visible == self._detail_visible:
             return
@@ -831,19 +933,28 @@ class GlobeRenderer:
         self._detail_actor.SetVisibility(visible)
         self._sphere_actor.SetVisibility(True)
         self._detail_visible = visible
+        if not visible:
+            self._set_local_visible(False)
 
-    def _set_path(self, points: list[np.ndarray]) -> None:
-        # Skip rebuild when the stroked path hasn't grown (avoids per-hold flicker).
-        if len(points) == self._last_path_len and self._path_actor is not None:
+    def _set_path(self, points: list[np.ndarray], distance: float) -> None:
+        radius = path_tube_radius(distance)
+        # Quantize so tiny zoom steps don't rebuild the tube every frame.
+        radius_key = round(radius, 6)
+        if (
+            len(points) == self._last_path_len
+            and self._path_actor is not None
+            and radius_key == self._last_path_radius_key
+        ):
             return
         if self._path_actor is not None:
             self._plotter.remove_actor(self._path_actor, render=False)
             self._path_actor = None
         poly = _path_polydata(points)
         self._last_path_len = len(points)
+        self._last_path_radius_key = radius_key
         if poly is None:
             return
-        tube = poly.tube(radius=PATH_RADIUS, n_sides=12)
+        tube = poly.tube(radius=radius, n_sides=12)
         self._path_actor = self._plotter.add_mesh(
             tube,
             color=PATH_COLOR,
@@ -870,8 +981,11 @@ class GlobeRenderer:
         ]
         self._plotter.camera.view_angle = CAMERA_VFOV_DEG
 
-        self._set_detail_visible(use_detail and distance <= DETAIL_DIST_MAX)
-        self._set_path(path_points)
+        show_detail = use_detail and distance <= DETAIL_DIST_MAX
+        self._set_detail_visible(show_detail)
+        if show_detail:
+            self._maybe_update_local_detail(focus_lat, focus_lng, distance)
+        self._set_path(path_points, distance)
 
         self._plotter.render()
         shot = self._plotter.screenshot(return_img=True, transparent_background=False)
@@ -927,9 +1041,21 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
     if not positions:
         return []
 
-    close_dist = close_camera_distance(positions)
     overview_dist = overview_camera_distance(positions)
     center_lat, center_lng = journey_center(positions)
+    leg_dists = [
+        close_camera_distance_for_span(
+            angular_distance_deg(
+                positions[i].lat,
+                positions[i].lng,
+                positions[i + 1].lat,
+                positions[i + 1].lng,
+            )
+        )
+        for i in range(len(positions) - 1)
+    ]
+    # Intro lands on the first leg's framing; single-stop journeys stay tight.
+    tracking_dist = leg_dists[0] if leg_dists else CAM_DIST_CLOSE_MIN
     states: list[_FrameState] = []
     completed_path: list[np.ndarray] = [
         ll_to_xyz(positions[0].lat, positions[0].lng, PATH_RADIUS_R)
@@ -952,7 +1078,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
 
     for f in range(ZOOM_IN_FRAMES):
         t = _ease_in_out(1.0 if ZOOM_IN_FRAMES <= 1 else (f + 1) / ZOOM_IN_FRAMES)
-        dist = CAM_DIST_WIDE + t * (close_dist - CAM_DIST_WIDE)
+        dist = CAM_DIST_WIDE + t * (tracking_dist - CAM_DIST_WIDE)
         states.append(
             _FrameState(
                 focus_lat=p0_lat,
@@ -974,6 +1100,8 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
         leg = great_circle_arch_xyz(a.lat, a.lng, b.lat, b.lng, PATH_SAMPLES)
         a_xyz = ll_to_xyz(a.lat, a.lng)
         b_xyz = ll_to_xyz(b.lat, b.lng)
+        leg_dist = leg_dists[i]
+        start_dist = tracking_dist
 
         for f in range(n_travel):
             # Linear progress — easing per leg caused visible slowdown/jump at waypoints.
@@ -981,11 +1109,14 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
             trav_lat, trav_lng = xyz_to_ll(slerp(a_xyz, b_xyz, t))
             end_idx = max(1, int(round(t * (len(leg) - 1))))
             progressive = completed_path + leg[1 : end_idx + 1]
+            # Ease zoom between consecutive legs so short hops pull in smoothly.
+            zoom_t = _ease_in_out(t)
+            dist = start_dist + zoom_t * (leg_dist - start_dist)
             states.append(
                 _FrameState(
                     focus_lat=trav_lat,
                     focus_lng=trav_lng,
-                    distance=close_dist,
+                    distance=dist,
                     path_points=progressive,
                     marker_indices=list(range(i + 1)),
                     traveler=leg[end_idx],
@@ -994,6 +1125,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                 )
             )
 
+        tracking_dist = leg_dist
         completed_path = completed_path + leg[1:]
         hold_n = hold_frames_for_days(b.days)
         for _ in range(hold_n):
@@ -1001,7 +1133,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                 _FrameState(
                     focus_lat=b.lat,
                     focus_lng=b.lng,
-                    distance=close_dist,
+                    distance=tracking_dist,
                     path_points=list(completed_path),
                     marker_indices=list(range(i + 2)),
                     traveler=None,
@@ -1017,7 +1149,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
     # Pull back only far enough to frame the full route on the tile mosaic.
     for f in range(ZOOM_OUT_FRAMES):
         t = _ease_in_out(1.0 if ZOOM_OUT_FRAMES <= 1 else (f + 1) / ZOOM_OUT_FRAMES)
-        dist = close_dist + t * (overview_dist - close_dist)
+        dist = tracking_dist + t * (overview_dist - tracking_dist)
         focus_lat, focus_lng = xyz_to_ll(slerp(last_xyz, center_xyz, t))
         states.append(
             _FrameState(
@@ -1047,6 +1179,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
             )
         )
     return states
+
 
 
 def total_frames(positions: list[Position]) -> int:

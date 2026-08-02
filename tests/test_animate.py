@@ -22,12 +22,14 @@ from journeymap.animate import (
     MAX_HOLD_FRAMES,
     MIN_HOLD_FRAMES,
     OUTRO_HOLD,
+    PATH_REF_DISTANCE,
     TILE_ZOOM_MIN,
     ZOOM_IN_FRAMES,
     ZOOM_OUT_FRAMES,
     angular_distance_deg,
     build_frame_states,
     close_camera_distance,
+    close_camera_distance_for_span,
     generate_animation,
     great_circle_arch_xyz,
     great_circle_points,
@@ -45,6 +47,8 @@ from journeymap.animate import (
     path_arch_peak,
     PATH_ARCH_MAX,
     PATH_RADIUS_R,
+    path_tube_radius,
+    path_width_px,
     route_marker_size,
     scale_image,
     slerp,
@@ -259,7 +263,7 @@ def test_view_half_angle_positive():
 def test_close_camera_distance_tighter_for_short_span():
     short = [
         Position(date="a", lat=45.5, lng=13.6, days=1),
-        Position(date="b", lat=43.5, lng=16.4, days=1),
+        Position(date="b", lat=45.4, lng=13.7, days=1),
     ]
     long = [
         Position(date="a", lat=40.0, lng=-74.0, days=1),
@@ -267,6 +271,12 @@ def test_close_camera_distance_tighter_for_short_span():
     ]
     assert close_camera_distance(short) < close_camera_distance(long)
     assert CAM_DIST_CLOSE_MIN <= close_camera_distance(short) <= CAM_DIST_CLOSE_MAX
+
+
+def test_close_camera_distance_for_span_pulls_in_for_short_hops():
+    assert close_camera_distance_for_span(0.2) < close_camera_distance_for_span(2.0)
+    assert close_camera_distance_for_span(2.0) <= close_camera_distance_for_span(20.0)
+    assert CAM_DIST_CLOSE_MIN <= close_camera_distance_for_span(0.05) <= CAM_DIST_CLOSE_MAX
 
 
 def test_build_frame_states_single():
@@ -285,14 +295,33 @@ def test_build_frame_states_zooms_from_wide_to_close():
         Position(date="a", lat=45.5, lng=13.6, days=1),
         Position(date="b", lat=43.5, lng=16.4, days=1),
     ]
+    leg_dist = close_camera_distance_for_span(
+        angular_distance_deg(45.5, 13.6, 43.5, 16.4)
+    )
     states = build_frame_states(positions)
     assert states[0].distance == CAM_DIST_WIDE
     zoom_end = states[INTRO_HOLD + ZOOM_IN_FRAMES - 1]
-    assert zoom_end.distance == pytest.approx(close_camera_distance(positions))
-    # Mid-journey (after zoom-in, before zoom-out) stays close.
+    assert zoom_end.distance == pytest.approx(leg_dist)
+    # Mid-journey tracks the current leg's framing.
     mid = states[INTRO_HOLD + ZOOM_IN_FRAMES]
-    assert mid.distance == pytest.approx(close_camera_distance(positions))
+    assert mid.distance == pytest.approx(leg_dist)
     assert states[-1].distance == pytest.approx(overview_camera_distance(positions))
+
+
+def test_build_frame_states_zooms_in_for_short_legs():
+    positions = [
+        Position(date="a", lat=43.57, lng=15.94, days=1),
+        Position(date="b", lat=43.59, lng=15.93, days=1),  # ~0.02°
+        Position(date="c", lat=39.49, lng=20.26, days=1),  # ~6°
+    ]
+    states = build_frame_states(positions)
+    travel = [s for s in states if s.traveler is not None]
+    assert travel
+    short_leg = [s for s in travel if s.focus_lat > 43.0]
+    long_leg = [s for s in travel if s.focus_lat < 42.0]
+    assert short_leg and long_leg
+    assert min(s.distance for s in short_leg) < min(s.distance for s in long_leg)
+    assert min(s.distance for s in short_leg) < close_camera_distance(positions)
 
 
 def test_build_frame_states_outro_shows_full_route():
@@ -334,11 +363,24 @@ def test_overview_camera_distance_fits_route_not_globe():
 
 def test_route_marker_size_tracks_path_and_stays_small():
     close = route_marker_size(CAM_DIST_CLOSE_MIN)
-    far = route_marker_size(2.0)
+    mid = route_marker_size(PATH_REF_DISTANCE)
     assert close <= MARKER_SIZE_MAX
-    assert far <= close
+    assert mid <= MARKER_SIZE_MAX
+    # Within tracking zoom, path width (and markers) stay roughly constant.
+    assert close == mid
     assert route_marker_size(CAM_DIST_CLOSE_MIN, render_scale=2) >= close
     assert route_marker_size(CAM_DIST_CLOSE_MIN, render_scale=2) <= MARKER_SIZE_MAX * 2
+
+
+def test_path_tube_radius_scales_with_zoom():
+    close = path_tube_radius(CAM_DIST_CLOSE_MIN)
+    mid = path_tube_radius(PATH_REF_DISTANCE)
+    far = path_tube_radius(2.0)
+    assert close < mid < far
+    # On-screen width stays roughly constant across zoom.
+    assert path_width_px(CAM_DIST_CLOSE_MIN) == pytest.approx(
+        path_width_px(PATH_REF_DISTANCE), rel=0.15
+    )
 
 
 
