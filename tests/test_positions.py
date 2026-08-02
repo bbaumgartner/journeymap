@@ -6,6 +6,8 @@ import json
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from journeymap.positions import (
     CLUSTER_THRESHOLD_DEG,
     JourneyMap,
@@ -14,6 +16,7 @@ from journeymap.positions import (
     _JournalEntry,
     cluster_positions,
     extract_positions,
+    read_journey_json,
     write_journey_json,
 )
 
@@ -204,3 +207,64 @@ def test_write_json_empty(tmp_path: Path):
     output = tmp_path / "journey.json"
     write_journey_json(JourneyMap(positions=[]), output)
     assert json.loads(output.read_text(encoding="utf-8")) == {"positions": []}
+
+
+# ---- read_journey_json ------------------------------------------------------
+
+
+def test_read_json_round_trip(tmp_path: Path):
+    path = tmp_path / "journey.json"
+    journey = JourneyMap(
+        positions=[
+            Position(date="2025-09-13", lat=45.5127, lng=13.5954, days=126),
+            Position(date="2026-01-17", lat=43.5088, lng=16.4402, days=10),
+        ]
+    )
+    write_journey_json(journey, path)
+    got = read_journey_json(path)
+    assert got.positions == journey.positions
+
+
+def test_read_json_empty_positions(tmp_path: Path):
+    path = tmp_path / "journey.json"
+    path.write_text('{"positions": []}\n', encoding="utf-8")
+    assert read_journey_json(path).positions == []
+
+
+def test_read_json_missing_positions_key(tmp_path: Path):
+    path = tmp_path / "journey.json"
+    path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing required key 'positions'"):
+        read_journey_json(path)
+
+
+def test_read_json_invalid_date(tmp_path: Path):
+    path = tmp_path / "journey.json"
+    path.write_text(
+        json.dumps(
+            {
+                "positions": [
+                    {"date": "13-09-2025", "lat": 1.0, "lng": 2.0, "days": 1},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        read_journey_json(path)
+
+
+def test_read_json_days_must_be_positive(tmp_path: Path):
+    path = tmp_path / "journey.json"
+    path.write_text(
+        json.dumps(
+            {
+                "positions": [
+                    {"date": "2025-09-13", "lat": 1.0, "lng": 2.0, "days": 0},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="days must be >= 1"):
+        read_journey_json(path)

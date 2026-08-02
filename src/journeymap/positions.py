@@ -1,4 +1,4 @@
-"""Extract journey positions from Logseq journals and render the animated map."""
+"""Extract journey positions from Logseq journals or JSON and render the animated map."""
 
 from __future__ import annotations
 
@@ -144,11 +144,58 @@ def write_journey_json(journey: JourneyMap, output_path: Path | str) -> None:
     output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def generate_journey_map(journals_dir: Path | str, out_mp4: Path) -> bool:
-    """Extract positions from journals and render ``out_mp4``."""
+def read_journey_json(path: Path | str) -> JourneyMap:
+    """Load a clustered journey from JSON (inverse of ``write_journey_json``)."""
+    path = Path(path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        raise ValueError(f"invalid JSON in {path}: {err}") from err
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"journey JSON must be an object, got {type(raw).__name__}")
+    if "positions" not in raw:
+        raise ValueError("journey JSON missing required key 'positions'")
+    positions_raw = raw["positions"]
+    if not isinstance(positions_raw, list):
+        raise ValueError("'positions' must be an array")
+
+    positions: list[Position] = []
+    for i, item in enumerate(positions_raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"positions[{i}] must be an object")
+        for key in ("date", "lat", "lng", "days"):
+            if key not in item:
+                raise ValueError(f"positions[{i}] missing required key '{key}'")
+
+        date_val = item["date"]
+        if not isinstance(date_val, str):
+            raise ValueError(f"positions[{i}].date must be a string")
+        try:
+            date.fromisoformat(date_val)
+        except ValueError as err:
+            raise ValueError(
+                f"positions[{i}].date must be YYYY-MM-DD, got {date_val!r}"
+            ) from err
+
+        try:
+            lat = float(item["lat"])
+            lng = float(item["lng"])
+            days = int(item["days"])
+        except (TypeError, ValueError) as err:
+            raise ValueError(f"positions[{i}] has invalid lat/lng/days") from err
+        if days < 1:
+            raise ValueError(f"positions[{i}].days must be >= 1, got {days}")
+
+        positions.append(Position(date=date_val, lat=lat, lng=lng, days=days))
+
+    return JourneyMap(positions=positions)
+
+
+def render_journey_map(journey: JourneyMap, out_mp4: Path | str) -> bool:
+    """Render ``out_mp4`` from an already-built ``JourneyMap``."""
     from .animate import generate_animation
 
-    journey = extract_positions(journals_dir)
     if not journey.positions:
         log.info("no journey positions found — skipping animation")
         return False
@@ -165,3 +212,8 @@ def generate_journey_map(journals_dir: Path | str, out_mp4: Path) -> bool:
         log.info("journey animation written to %s", out_mp4)
         return True
     return False
+
+
+def generate_journey_map(journals_dir: Path | str, out_mp4: Path) -> bool:
+    """Extract positions from journals and render ``out_mp4``."""
+    return render_journey_map(extract_positions(journals_dir), out_mp4)

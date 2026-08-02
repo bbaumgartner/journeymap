@@ -16,8 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="journeymap",
         description=(
-            "Extract current-position:: entries from Logseq journals and render "
-            "an animated journey-map MP4."
+            "Render an animated journey-map MP4 from Logseq journals or a positions JSON file."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -26,13 +25,18 @@ def main(argv: list[str] | None = None) -> int:
 
     p_gen = sub.add_parser(
         "generate",
-        help="Scan journals and write journey-map.mp4",
+        help="Render journey-map.mp4 from journals or positions JSON",
     )
-    p_gen.add_argument(
+    source = p_gen.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--journals",
         type=Path,
-        required=True,
         help="Path to the Logseq journals/ directory",
+    )
+    source.add_argument(
+        "--positions",
+        type=Path,
+        help="Path to a journey positions JSON file (see schemas/journey.schema.json)",
     )
     p_gen.add_argument(
         "--output",
@@ -45,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         "--json",
         type=Path,
         default=None,
-        help="Optional path to also write the clustered positions as JSON",
+        help="Optional path to also write the clustered positions as JSON (with --journals)",
     )
 
     args = parser.parse_args(argv)
@@ -55,7 +59,38 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "generate":
-        from .positions import extract_positions, generate_journey_map, write_journey_json
+        from .positions import (
+            extract_positions,
+            generate_journey_map,
+            read_journey_json,
+            render_journey_map,
+            write_journey_json,
+        )
+
+        out = args.output.expanduser()
+
+        if args.positions is not None:
+            if args.json is not None:
+                print("error: --json is only valid with --journals", file=sys.stderr)
+                return 1
+
+            positions_path = args.positions.expanduser().resolve()
+            if not positions_path.is_file():
+                print(f"error: positions file not found: {positions_path}", file=sys.stderr)
+                return 1
+
+            try:
+                journey = read_journey_json(positions_path)
+            except ValueError as err:
+                print(f"error: {err}", file=sys.stderr)
+                return 1
+
+            ok = render_journey_map(journey, out)
+            if not ok:
+                print("error: no positions found or render failed", file=sys.stderr)
+                return 1
+            print(out.resolve())
+            return 0
 
         journals = args.journals.expanduser().resolve()
         if not journals.is_dir():
@@ -69,11 +104,11 @@ def main(argv: list[str] | None = None) -> int:
                 "wrote %d positions to %s", len(journey.positions), args.json
             )
 
-        ok = generate_journey_map(journals, args.output.expanduser())
+        ok = generate_journey_map(journals, out)
         if not ok:
             print("error: no positions found or render failed", file=sys.stderr)
             return 1
-        print(args.output.expanduser().resolve())
+        print(out.resolve())
         return 0
 
     return 1
