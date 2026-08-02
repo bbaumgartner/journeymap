@@ -62,7 +62,10 @@ This is the same format written by `--json` when generating from journals.
 
 ## Tile cache
 
-OSM tiles are cached under `~/.cache/journeymap/tiles/`.
+OSM tiles are cached under `~/.cache/journeymap/tiles/`. The full-globe base
+texture is baked from low-zoom OSM tiles and cached as
+`~/.cache/journeymap/earth_osm_z3_2048x1024.png` (higher-res tiles still drape
+for close-ups).
 
 ## Development
 

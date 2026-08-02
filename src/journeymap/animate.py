@@ -1,7 +1,9 @@
 """Render an animated 3D journey globe MP4 from clustered positions.
 
-PyVista offscreen sphere with a low-res base texture for wide shots and OSM
-map tiles draped on the surface for sharp close-ups. Frames assembled with ffmpeg.
+PyVista offscreen sphere with an OSM-baked equirectangular base texture for
+wide / planet shots, plus a higher-res OSM mosaic draped on top for sharp
+close-ups (globe stays visible underneath so zoom-out never hits empty space).
+Frames assembled with ffmpeg.
 """
 
 from __future__ import annotations
@@ -63,17 +65,23 @@ PITCH_OFFSET_DEG = 2.5
 MAX_TILES = 96
 TILE_ZOOM_MIN = 4
 TILE_ZOOM_MAX = 13
+# Low-z OSM mosaic → equirect bake for the full-globe base texture.
+WORLD_TILE_ZOOM = 3
+WORLD_EQUIRECT_WIDTH = 2048
+WORLD_EQUIRECT_HEIGHT = 1024
 # Journey mosaic stays up through the route-overview outro.
 DETAIL_DIST_MAX = 3.0
 # Padding around the journey bbox when building the fixed detail mosaic.
-JOURNEY_PAD_DEG = 0.6
-JOURNEY_PAD_FRAC = 0.25
+JOURNEY_PAD_DEG = 1.2
+JOURNEY_PAD_FRAC = 0.45
 # Logo markers track the on-screen path width (not days-based size).
 MARKER_PATH_SCALE = 5.0
 MARKER_SIZE_MIN = 24
-MARKER_SIZE_MAX =72
+MARKER_SIZE_MAX = 72
 # Lower CRF = sharper text in the H.264 encode.
 FFMPEG_CRF = 17
+# Web Mercator latitude limit (degrees).
+_MERCATOR_LAT_MAX = 85.05112878
 
 _OSM_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 _USER_AGENT = "journeymap/0.1 (https://github.com/bbaumgartner/journeymap)"
@@ -88,6 +96,7 @@ def load_logo() -> Image.Image:
 
 
 def load_earth_texture() -> Image.Image:
+    """Bundled satellite equirect; kept as offline fallback for the globe base."""
     path = files("journeymap") / "assets" / "earth.jpg"
     with path.open("rb") as f:
         return Image.open(f).convert("RGB")
@@ -325,7 +334,7 @@ def tile_cache_dir() -> Path:
 
 
 def latlng_to_tile(lat: float, lng: float, zoom: int) -> tuple[int, int]:
-    lat = max(-85.05112878, min(85.05112878, lat))
+    lat = max(-_MERCATOR_LAT_MAX, min(_MERCATOR_LAT_MAX, lat))
     n = 2**zoom
     x = int((lng + 180.0) / 360.0 * n) % n
     lat_r = math.radians(lat)
@@ -336,7 +345,7 @@ def latlng_to_tile(lat: float, lng: float, zoom: int) -> tuple[int, int]:
 
 def lat_to_mercator_y_norm(lat: float) -> float:
     """Latitude degrees → Web Mercator Y in [0, 1] (0 = north)."""
-    lat = max(-85.05112878, min(85.05112878, lat))
+    lat = max(-_MERCATOR_LAT_MAX, min(_MERCATOR_LAT_MAX, lat))
     lat_r = math.radians(lat)
     return (1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0
 
@@ -480,6 +489,74 @@ def solid_tile_fetcher(color: tuple[int, int, int] = (200, 210, 220)) -> TileFet
     return fetch
 
 
+def world_osm_tiles(zoom: int = WORLD_TILE_ZOOM) -> list[tuple[int, int, int]]:
+    """All OSM tiles at ``zoom`` covering the Web Mercator world."""
+    n = 2**zoom
+    return [(zoom, x, y) for y in range(n) for x in range(n)]
+
+
+def mercator_mosaic_to_equirect(
+    mercator: Image.Image,
+    width: int = WORLD_EQUIRECT_WIDTH,
+    height: int = WORLD_EQUIRECT_HEIGHT,
+) -> Image.Image:
+    """Warp a full-world Web Mercator mosaic to equirectangular (plate carrée).
+
+    Poles beyond ±``_MERCATOR_LAT_MAX`` sample the nearest Mercator edge so the
+    sphere has continuous coverage without a satellite fallback texture.
+    """
+    src = np.asarray(mercator.convert("RGB"), dtype=np.uint8)
+    sh, sw = src.shape[0], src.shape[1]
+    rows = np.arange(height, dtype=np.float64)
+    cols = np.arange(width, dtype=np.float64)
+    # Image row 0 = geographic north (matches ``_equirect_sphere`` UVs).
+    lats = 90.0 - (rows + 0.5) / height * 180.0
+    lngs = (cols + 0.5) / width * 360.0 - 180.0
+    lat_clip = np.clip(lats, -_MERCATOR_LAT_MAX, _MERCATOR_LAT_MAX)
+    lat_r = np.radians(lat_clip)
+    y_norm = (1.0 - np.arcsinh(np.tan(lat_r)) / math.pi) / 2.0
+    # Map into pixel centres of the source mosaic.
+    my = np.clip(y_norm * sh - 0.5, 0.0, sh - 1.0)
+    mx = np.clip(((lngs + 180.0) / 360.0) * sw - 0.5, 0.0, sw - 1.0)
+    iy = np.rint(my).astype(np.intp)
+    ix = np.rint(mx).astype(np.intp)
+    # Broadcast: (height, 1) rows × (1, width) cols → (height, width).
+    out = src[iy[:, None], ix[None, :], :]
+    return Image.fromarray(out, mode="RGB")
+
+
+def osm_earth_cache_path(
+    zoom: int = WORLD_TILE_ZOOM,
+    width: int = WORLD_EQUIRECT_WIDTH,
+    height: int = WORLD_EQUIRECT_HEIGHT,
+) -> Path:
+    return Path.home() / ".cache" / "journeymap" / f"earth_osm_z{zoom}_{width}x{height}.png"
+
+
+def build_osm_earth_texture(
+    fetcher: TileFetcher,
+    *,
+    zoom: int = WORLD_TILE_ZOOM,
+    width: int = WORLD_EQUIRECT_WIDTH,
+    height: int = WORLD_EQUIRECT_HEIGHT,
+    cache_path: Path | None = None,
+) -> Image.Image:
+    """Build (or load cached) equirectangular Earth texture from OSM world tiles."""
+    path = cache_path if cache_path is not None else osm_earth_cache_path(zoom, width, height)
+    if path.exists():
+        with path.open("rb") as f:
+            return Image.open(f).convert("RGB")
+    tiles = world_osm_tiles(zoom)
+    mosaic = _mosaic_from_tiles(tiles, fetcher)
+    if mosaic is None:
+        raise RuntimeError(f"failed to build world OSM mosaic at z={zoom}")
+    img, _z, _x0, _x1, _y0, _y1 = mosaic
+    equirect = mercator_mosaic_to_equirect(img, width, height)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    equirect.save(path, format="PNG")
+    return equirect
+
+
 # ---- PyVista scene ---------------------------------------------------------
 
 
@@ -497,8 +574,7 @@ def _equirect_sphere(texture_img: Image.Image, resolution: int = 90) -> tuple[pv
     # OpenGL/VTK: V=1 samples the first image row (north in equirect sources).
     v = 0.5 + lat / np.pi
     sphere.active_texture_coordinates = np.column_stack([u, np.clip(v, 0.0, 1.0)])
-    arr = np.asarray(texture_img.convert("RGB"), dtype=np.uint8)
-    tex = pv.Texture(arr)
+    tex = _map_texture(texture_img)
     return sphere, tex
 
 
@@ -526,7 +602,39 @@ def _mosaic_from_tiles(
         px = (x - x0) * tile_w
         py = (y - y0) * tile_h
         mosaic.paste(img.convert("RGB"), (px, py))
+    mosaic = _heal_tile_seams(mosaic, tile_w)
     return mosaic, z, x0, x1, y0, y1
+
+
+def _heal_tile_seams(mosaic: Image.Image, tile_size: int = 256) -> Image.Image:
+    """Average pixels across internal tile boundaries to hide hairline seams."""
+    arr = np.asarray(mosaic.convert("RGB"), dtype=np.uint8).copy()
+    h, w = arr.shape[0], arr.shape[1]
+    for x in range(tile_size, w, tile_size):
+        left = arr[:, x - 1].astype(np.float32)
+        right = arr[:, x].astype(np.float32)
+        mid = ((left + right) * 0.5).astype(np.uint8)
+        arr[:, x - 1] = mid
+        arr[:, x] = mid
+    for y in range(tile_size, h, tile_size):
+        top = arr[y - 1].astype(np.float32)
+        bottom = arr[y].astype(np.float32)
+        mid = ((top + bottom) * 0.5).astype(np.uint8)
+        arr[y - 1] = mid
+        arr[y] = mid
+    return Image.fromarray(arr, mode="RGB")
+
+
+def _map_texture(img: Image.Image) -> pv.Texture:
+    """RGB texture with filtering on and mipmaps off (mipmaps exaggerate tile seams)."""
+    tex = pv.Texture(np.asarray(img.convert("RGB"), dtype=np.uint8))
+    tex.InterpolateOn()
+    mipmap_off = getattr(tex, "MipmapOff", None)
+    if callable(mipmap_off):
+        mipmap_off()
+    elif hasattr(tex, "SetMipmap"):
+        tex.SetMipmap(False)
+    return tex
 
 
 def _region_patch_mesh(
@@ -579,7 +687,7 @@ def _region_patch_mesh(
     mesh = pv.PolyData(points_a, faces=np.asarray(faces, dtype=np.int64))
     mesh.active_texture_coordinates = uvs_a
     mesh.compute_normals(cell_normals=False, point_normals=True, inplace=True)
-    tex = pv.Texture(np.asarray(img.convert("RGB"), dtype=np.uint8))
+    tex = _map_texture(img)
     return mesh, tex
 
 
@@ -661,6 +769,10 @@ class GlobeRenderer:
             texture=self._base_tex,
             smooth_shading=True,
             show_edges=False,
+            # Flat map look — lighting shade can read as false tile borders.
+            ambient=1.0,
+            diffuse=0.0,
+            specular=0.0,
         )
         self._detail_actor = None
         self._detail_ready = False
@@ -702,6 +814,9 @@ class GlobeRenderer:
             texture=tex,
             smooth_shading=True,
             show_edges=False,
+            ambient=1.0,
+            diffuse=0.0,
+            specular=0.0,
         )
         self._detail_actor.SetVisibility(False)
         self._detail_ready = True
@@ -712,9 +827,9 @@ class GlobeRenderer:
             return
         if visible == self._detail_visible:
             return
-        # Never mix globe + mosaic: exactly one of them is shown.
+        # Keep the OSM globe under the mosaic so zoom-out never hits empty space.
         self._detail_actor.SetVisibility(visible)
-        self._sphere_actor.SetVisibility(not visible)
+        self._sphere_actor.SetVisibility(True)
         self._detail_visible = visible
 
     def _set_path(self, points: list[np.ndarray]) -> None:
@@ -912,7 +1027,8 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                 path_points=list(completed_path),
                 marker_indices=list(range(len(positions))),
                 traveler=None,
-                pitch=1.0 - 0.25 * t,
+                # Drop pitch so the mosaic (not empty space) fills the frame.
+                pitch=1.0 - t,
                 use_detail=True,
             )
         )
@@ -926,7 +1042,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                 path_points=list(completed_path),
                 marker_indices=list(range(len(positions))),
                 traveler=None,
-                pitch=0.75,
+                pitch=0.0,
                 use_detail=True,
             )
         )
@@ -967,6 +1083,9 @@ def generate_animation(
     """Render ``journey`` to an H.264 MP4 at ``output_path``.
 
     ``earth_texture``, ``logo``, and ``tile_fetcher`` may be injected for tests.
+    When ``earth_texture`` is omitted, an OSM world mosaic is baked to equirect
+    (cached under ``~/.cache/journeymap/``); the bundled satellite texture is
+    only used if that bake fails.
     """
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not found on $PATH. Install it with: brew install ffmpeg")
@@ -978,12 +1097,16 @@ def generate_animation(
 
     if logo is None:
         logo = load_logo()
-    if earth_texture is None:
-        log.info("Loading Earth texture...")
-        earth_texture = load_earth_texture()
     own_fetcher = tile_fetcher is None
     if tile_fetcher is None:
         tile_fetcher = default_tile_fetcher()
+    if earth_texture is None:
+        log.info("Building OSM Earth texture (z=%d)...", WORLD_TILE_ZOOM)
+        try:
+            earth_texture = build_osm_earth_texture(tile_fetcher)
+        except Exception:
+            log.exception("OSM Earth bake failed; falling back to bundled texture")
+            earth_texture = load_earth_texture()
 
     states = build_frame_states(journey.positions)
     total = len(states)

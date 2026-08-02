@@ -412,6 +412,74 @@ def test_load_earth_texture():
     assert w == 2 * h
 
 
+def test_world_osm_tiles_cover_zoom():
+    from journeymap.animate import WORLD_TILE_ZOOM, world_osm_tiles
+
+    tiles = world_osm_tiles(2)
+    assert len(tiles) == 16
+    assert all(t[0] == 2 for t in tiles)
+    assert world_osm_tiles(WORLD_TILE_ZOOM)
+    n = 2**WORLD_TILE_ZOOM
+    assert len(world_osm_tiles()) == n * n
+
+
+def test_mercator_mosaic_to_equirect_size_and_poles():
+    from journeymap.animate import mercator_mosaic_to_equirect
+
+    # Distinct north/south so we can check orientation after warp.
+    merc = Image.new("RGB", (256, 256), (0, 80, 160))
+    for y in range(32):
+        for x in range(256):
+            merc.putpixel((x, y), (220, 40, 40))  # north strip
+            merc.putpixel((x, 255 - y), (40, 220, 40))  # south strip
+    eq = mercator_mosaic_to_equirect(merc, width=128, height=64)
+    assert eq.size == (128, 64)
+    assert eq.mode == "RGB"
+    # Row 0 is north → reddish; last row is south → greenish.
+    north = eq.getpixel((64, 0))
+    south = eq.getpixel((64, 63))
+    assert north[0] > north[2]
+    assert south[1] > south[0]
+
+
+def test_build_osm_earth_texture_uses_cache(tmp_path: Path):
+    from journeymap.animate import build_osm_earth_texture
+
+    cache = tmp_path / "earth.png"
+    fetcher = solid_tile_fetcher((11, 22, 33))
+    first = build_osm_earth_texture(
+        fetcher, zoom=1, width=64, height=32, cache_path=cache
+    )
+    assert first.size == (64, 32)
+    assert cache.exists()
+    # Second call must hit cache (even if fetcher would differ).
+    second = build_osm_earth_texture(
+        solid_tile_fetcher((200, 0, 0)),
+        zoom=1,
+        width=64,
+        height=32,
+        cache_path=cache,
+    )
+    assert second.getpixel((0, 0)) == first.getpixel((0, 0))
+    assert second.getpixel((0, 0)) == (11, 22, 33)
+
+
+def test_heal_tile_seams_averages_boundaries():
+    from journeymap.animate import _heal_tile_seams
+
+    # Two horizontal tiles: left red, right blue → seam should blend.
+    img = Image.new("RGB", (512, 256), (255, 0, 0))
+    for y in range(256):
+        for x in range(256, 512):
+            img.putpixel((x, y), (0, 0, 255))
+    healed = _heal_tile_seams(img, 256)
+    seam_l = healed.getpixel((255, 128))
+    seam_r = healed.getpixel((256, 128))
+    assert seam_l == seam_r
+    assert seam_l[0] == seam_l[2]  # purple-ish average
+    assert 100 < seam_l[0] < 160
+
+
 def test_solid_tile_fetcher():
     fetcher = solid_tile_fetcher((10, 20, 30))
     img = fetcher(5, 1, 2)
