@@ -1,18 +1,12 @@
 # journeymap
 
-Renders an animated 3D journey-map MP4 from Logseq journal
-`current-position:: lat, lng` entries. Independent of the
-[syndicator](https://github.com/bbaumgartner/syndicator) publish pipeline —
-run this whenever you want to refresh the homepage video.
+Renders an animated 3D journey-map MP4 from Logseq journal `current-position:: lat, lng` entries.
 
-The Hugo site serves the result as `/journey-map.mp4`
-(typically committed under `sailingnomads/static/journey-map.mp4`).
+https://github.com/user-attachments/assets/b1d546c8-41ae-4056-9815-e59e68259c43
 
 ## Setup
 
 ```bash
-git clone git@github.com:bbaumgartner/journeymap.git ~/git/journeymap
-cd ~/git/journeymap
 curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv is missing
 uv sync
 ```
@@ -28,22 +22,15 @@ Requirements:
 
 ```bash
 # From your Logseq journals directory → local MP4
-uv run journeymap generate \
-  --journals ~/saillog/journals \
-  --output ~/git/sailingnomads/static/journey-map.mp4
+uv run journeymap generate --journals ~/Documents/saillog/journals --output ~/git/sailingnomads/static/journey-map.mp4
 
 # Also dump clustered stops as JSON
-uv run journeymap generate \
-  --journals ~/saillog/journals \
-  -o journey-map.mp4 \
-  --json journey.json
+uv run journeymap generate --journals ~/saillog/journals -o journey-map.mp4 --json journey.json
 
 uv run journeymap version
 ```
 
-Journal convention: files named `YYYY_MM_DD.md` containing
-`current-position:: <lat>, <lng>` anywhere in the file. Nearby consecutive
-stops are clustered; days-at-stop drive hold timing in the animation.
+Journal convention: files named `YYYY_MM_DD.md` containing `current-position:: <lat>, <lng>` anywhere in the file. Nearby consecutive stops are clustered; days-at-stop drive hold timing in the animation.
 
 ## Tile cache
 
