@@ -75,7 +75,7 @@ OVERVIEW_MIN_HALF_DEG = 1.8
 CAMERA_VFOV_DEG = 30.0
 LOOK_AHEAD = 0.0  # camera tracks the traveler exactly (look-ahead caused focus jumps)
 PITCH_OFFSET_DEG = 2.5
-MAX_TILES = 96
+MAX_TILES = 200
 TILE_ZOOM_MIN = 4
 TILE_ZOOM_MAX = 13
 # Low-z OSM mosaic → equirect bake for the full-globe base texture.
@@ -83,8 +83,10 @@ TILE_ZOOM_MAX = 13
 WORLD_TILE_ZOOM = 4
 WORLD_EQUIRECT_WIDTH = 4096
 WORLD_EQUIRECT_HEIGHT = 2048
-# Journey mosaic for close tracking only — hide before overview so LODs don't clash.
-DETAIL_DIST_MAX = 1.35
+# Journey mosaic for close tracking; fade out before overview so LODs don't clash.
+DETAIL_DIST_MAX = 1.40
+DETAIL_FADE_START = 1.22  # begin opacity fade (distance backup)
+DETAIL_FADE_END = DETAIL_DIST_MAX
 # Local high-z overlay disabled: mixed LODs against the journey mosaic looked worse.
 LOCAL_DETAIL_MAX_DIST = 0.0
 LOCAL_DETAIL_RADIUS = 1.0028
@@ -132,6 +134,16 @@ def travel_frames_for_distance(angular_deg: float) -> int:
     """More frames for longer great-circle legs."""
     t = min(1.0, max(0.0, angular_deg / 40.0))
     return int(round(TRAVEL_FRAMES_MIN + t * (TRAVEL_FRAMES_MAX - TRAVEL_FRAMES_MIN)))
+
+
+def detail_opacity_for_distance(distance: float) -> float:
+    """1 while tracking; ease to 0 as the camera pulls back toward overview."""
+    if distance <= DETAIL_FADE_START:
+        return 1.0
+    if distance >= DETAIL_FADE_END:
+        return 0.0
+    t = (distance - DETAIL_FADE_START) / (DETAIL_FADE_END - DETAIL_FADE_START)
+    return 1.0 - _ease_in_out(t)
 
 
 def journey_span_deg(positions: list[Position]) -> float:
@@ -895,6 +907,7 @@ class GlobeRenderer:
         self._detail_actor = None
         self._detail_ready = False
         self._detail_visible = False
+        self._detail_opacity = 1.0
         self._journey_z = TILE_ZOOM_MIN
         self._local_actor = None
         self._local_key: tuple[int, int, int, int, int] | None = None
@@ -926,6 +939,7 @@ class GlobeRenderer:
             self._detail_actor = None
         self._detail_ready = False
         self._detail_visible = False
+        self._detail_opacity = 1.0
         tiles = tiles_for_journey(positions)
         if not tiles:
             return
@@ -1006,20 +1020,25 @@ class GlobeRenderer:
         self._local_key = key
         self._local_visible = True
 
-    def _set_detail_visible(self, visible: bool) -> None:
+    def _set_detail_visible(self, visible: bool, opacity: float = 1.0) -> None:
         if not self._detail_ready or self._detail_actor is None:
             self._sphere_actor.SetVisibility(True)
             if not visible:
                 self._set_local_visible(False)
             return
-        if visible == self._detail_visible:
-            return
+        opacity = min(1.0, max(0.0, opacity)) if visible else 0.0
+        show = visible and opacity > 1e-3
+        if show != self._detail_visible:
+            self._detail_actor.SetVisibility(show)
+            self._detail_visible = show
         # Keep the OSM globe under the mosaic so zoom-out never hits empty space.
-        self._detail_actor.SetVisibility(visible)
         self._sphere_actor.SetVisibility(True)
-        self._detail_visible = visible
-        if not visible:
+        if show and opacity != self._detail_opacity:
+            self._detail_actor.GetProperty().SetOpacity(opacity)
+            self._detail_opacity = opacity
+        if not show:
             self._set_local_visible(False)
+            self._detail_opacity = 0.0
 
     def _set_path(self, points: list[np.ndarray], distance: float) -> None:
         radius = path_tube_radius(distance)
@@ -1070,6 +1089,7 @@ class GlobeRenderer:
         path_points: list[np.ndarray],
         pitch: float,
         use_detail: bool,
+        detail_opacity: float = 1.0,
     ) -> Image.Image:
         pos, focal, view_up = _camera_pose(
             focus_lat, focus_lng, distance, pitch=pitch
@@ -1081,9 +1101,14 @@ class GlobeRenderer:
         ]
         self._plotter.camera.view_angle = CAMERA_VFOV_DEG
 
-        show_detail = use_detail and distance <= DETAIL_DIST_MAX
-        self._set_detail_visible(show_detail)
-        if show_detail:
+        opacity = 0.0
+        if use_detail:
+            opacity = min(
+                max(0.0, detail_opacity),
+                detail_opacity_for_distance(distance),
+            )
+        self._set_detail_visible(opacity > 1e-3, opacity)
+        if opacity > 1e-3:
             self._maybe_update_local_detail(focus_lat, focus_lng, distance)
         self._set_path(path_points, distance)
 
@@ -1120,6 +1145,7 @@ class _FrameState:
     traveler: np.ndarray | None
     pitch: float
     use_detail: bool
+    detail_opacity: float = 1.0
 
 
 def journey_center(positions: list[Position]) -> tuple[float, float]:
@@ -1173,12 +1199,16 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                 traveler=None,
                 pitch=0.0,
                 use_detail=False,
+                detail_opacity=0.0,
             )
         )
 
     for f in range(ZOOM_IN_FRAMES):
         t = _ease_in_out(1.0 if ZOOM_IN_FRAMES <= 1 else (f + 1) / ZOOM_IN_FRAMES)
         dist = CAM_DIST_WIDE + t * (tracking_dist - CAM_DIST_WIDE)
+        # Fade mosaic in only at the end of the dive.
+        detail_on = t > 0.88
+        detail_op = 0.0 if not detail_on else _ease_in_out((t - 0.88) / 0.12)
         states.append(
             _FrameState(
                 focus_lat=p0_lat,
@@ -1188,8 +1218,8 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                 marker_indices=[0],
                 traveler=None,
                 pitch=t,
-                # Only show detail once fully zoomed — avoids mid-zoom mosaic pops.
-                use_detail=dist <= DETAIL_DIST_MAX and t > 0.92,
+                use_detail=detail_on,
+                detail_opacity=detail_op,
             )
         )
 
@@ -1222,6 +1252,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                     traveler=leg[end_idx],
                     pitch=1.0,
                     use_detail=True,
+                    detail_opacity=1.0,
                 )
             )
 
@@ -1239,6 +1270,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                     traveler=None,
                     pitch=1.0,
                     use_detail=True,
+                    detail_opacity=1.0,
                 )
             )
 
@@ -1248,12 +1280,13 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
     # Overview: only endpoints — every stop logo on the full route is visual noise.
     overview_markers = [0] if len(positions) == 1 else [0, len(positions) - 1]
 
-    # Pull back and flatten arches → straight surface segments for a clear overview.
+    # Pull back: flatten arches and fade the journey mosaic together.
     for f in range(ZOOM_OUT_FRAMES):
         t = _ease_in_out(1.0 if ZOOM_OUT_FRAMES <= 1 else (f + 1) / ZOOM_OUT_FRAMES)
         dist = tracking_dist + t * (overview_dist - tracking_dist)
         focus_lat, focus_lng = xyz_to_ll(slerp(last_xyz, center_xyz, t))
         arch_scale = 1.0 - t
+        detail_op = 1.0 - t
         states.append(
             _FrameState(
                 focus_lat=focus_lat,
@@ -1263,7 +1296,8 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                 marker_indices=overview_markers,
                 traveler=None,
                 pitch=1.0 - t,
-                use_detail=dist <= DETAIL_DIST_MAX,
+                use_detail=detail_op > 1e-3,
+                detail_opacity=detail_op,
             )
         )
 
@@ -1279,6 +1313,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                 traveler=None,
                 pitch=0.0,
                 use_detail=False,
+                detail_opacity=0.0,
             )
         )
     return states
@@ -1374,6 +1409,7 @@ def generate_animation(
                     path_points=st.path_points,
                     pitch=st.pitch,
                     use_detail=st.use_detail,
+                    detail_opacity=st.detail_opacity,
                 )
                 # Marker size tracks the on-screen path thickness.
                 size = route_marker_size(st.distance, render_scale=RENDER_SCALE)

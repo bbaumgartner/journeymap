@@ -233,15 +233,19 @@ def test_visible_tiles_empty_when_far():
 
 
 def test_visible_tiles_near_are_capped():
+    from journeymap.animate import MAX_TILES
+
     tiles = visible_tiles(44.5, 15.0, CAM_DIST_CLOSE_MIN)
     assert tiles
-    assert len(tiles) <= 96
+    assert len(tiles) <= MAX_TILES
     zs = {t[0] for t in tiles}
     assert len(zs) == 1
     assert TILE_ZOOM_MIN <= next(iter(zs)) <= 13
 
 
 def test_tiles_for_journey_stable_and_covers_stops():
+    from journeymap.animate import MAX_TILES
+
     positions = [
         Position(date="a", lat=45.5127, lng=13.5954, days=1),
         Position(date="b", lat=43.5088, lng=16.4402, days=1),
@@ -250,7 +254,7 @@ def test_tiles_for_journey_stable_and_covers_stops():
     b = tiles_for_journey(positions)
     assert a == b
     assert a
-    assert len(a) <= 96
+    assert len(a) <= MAX_TILES
     # Single zoom level for the whole journey mosaic.
     assert len({t[0] for t in a}) == 1
 
@@ -401,6 +405,21 @@ def test_build_frame_states_outro_shows_full_route():
     assert dists[-1] == pytest.approx(overview)
     assert states[-1].use_detail is False
     assert all(s.marker_indices == [0, 1] for s in states[outro_start:])
+
+
+def test_zoom_out_fades_detail_mosaic():
+    positions = [
+        Position(date="a", lat=45.5, lng=13.6, days=1),
+        Position(date="b", lat=43.5, lng=16.4, days=1),
+    ]
+    states = build_frame_states(positions)
+    outro_start = len(states) - OUTRO_HOLD - ZOOM_OUT_FRAMES
+    zoom_out = states[outro_start : outro_start + ZOOM_OUT_FRAMES]
+    assert zoom_out[0].detail_opacity == pytest.approx(1.0, abs=0.05)
+    assert zoom_out[-1].detail_opacity == pytest.approx(0.0, abs=1e-6)
+    assert states[-1].detail_opacity == 0.0
+    mid = zoom_out[len(zoom_out) // 2].detail_opacity
+    assert 0.0 < mid < 1.0
 
 
 def test_zoom_out_flattens_path_arches():
