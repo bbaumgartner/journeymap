@@ -341,25 +341,33 @@ def great_circle_arch_xyz(
     lat2: float,
     lng2: float,
     n: int,
+    *,
+    arch_scale: float = 1.0,
 ) -> list[np.ndarray]:
     """Sample ``n`` XYZ points along a great-circle flight arch.
 
     Combines radial sine lift with a mild out-of-plane bow. Legs shorter than
     ``MIN_ARCH_LEG_DEG`` stay on the surface so dense coastal revisits don't
     turn into scribble loops.
+
+    ``arch_scale`` is 0..1 — 1 is a full flight arch, 0 is a flat surface
+    great-circle (used when flattening the path on zoom-out).
     """
+    arch_scale = min(1.0, max(0.0, arch_scale))
     if n < 2:
         return [ll_to_xyz(lat1, lng1, PATH_RADIUS_R)]
     a = ll_to_xyz(lat1, lng1)
     b = ll_to_xyz(lat2, lng2)
     ang = angular_distance_deg(lat1, lng1, lat2, lng2)
-    if ang < MIN_ARCH_LEG_DEG:
-        n_short = max(2, min(n, 8))
+    if ang < MIN_ARCH_LEG_DEG or arch_scale <= 1e-9:
+        # Flat surface segment. Keep sample count stable across arch_scale so
+        # zoom-out morphs don't change polyline topology mid-animation.
+        n_flat = n if ang >= MIN_ARCH_LEG_DEG else max(2, min(n, 8))
         return [
-            slerp(a, b, i / (n_short - 1)) * PATH_RADIUS_R for i in range(n_short)
+            slerp(a, b, i / (n_flat - 1)) * PATH_RADIUS_R for i in range(n_flat)
         ]
-    peak = path_arch_peak(ang)
-    lateral = path_lateral_peak(ang)
+    peak = path_arch_peak(ang) * arch_scale
+    lateral = path_lateral_peak(ang) * arch_scale
     normal = np.cross(a, b)
     nn = float(np.linalg.norm(normal))
     if nn > 1e-12:
@@ -381,6 +389,27 @@ def great_circle_arch_xyz(
         pt = direction * (PATH_RADIUS_R + peak * envelope) + normal * (lateral * envelope)
         out.append(pt)
     return out
+
+
+def journey_path_xyz(
+    positions: list[Position],
+    *,
+    arch_scale: float = 1.0,
+    samples: int = PATH_SAMPLES,
+) -> list[np.ndarray]:
+    """Full route polyline through ``positions`` at the given arch scale."""
+    if not positions:
+        return []
+    path: list[np.ndarray] = [
+        ll_to_xyz(positions[0].lat, positions[0].lng, PATH_RADIUS_R)
+    ]
+    for i in range(len(positions) - 1):
+        a, b = positions[i], positions[i + 1]
+        leg = great_circle_arch_xyz(
+            a.lat, a.lng, b.lat, b.lng, samples, arch_scale=arch_scale
+        )
+        path.extend(leg[1:])
+    return path
 
 
 def _camera_basis(lat: float, lng: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -873,6 +902,7 @@ class GlobeRenderer:
         self._path_actor = None
         self._last_path_len = -1
         self._last_path_radius_key = -1.0
+        self._last_path_geom_key = None
         # Disable default lighting extremes for a flatter map look.
         self._plotter.remove_all_lights()
         light = pv.Light(position=(5, 5, 5), light_type="scene light")
@@ -995,10 +1025,24 @@ class GlobeRenderer:
         radius = path_tube_radius(distance)
         # Quantize so tiny zoom steps don't rebuild the tube every frame.
         radius_key = round(radius, 6)
+        # Geometry key catches arch morphs when length + tube radius are unchanged
+        # (common on zoom-out once radius hits PATH_RADIUS_MAX).
+        if points:
+            mid = points[len(points) // 2]
+            peak = max(float(np.linalg.norm(p)) for p in points[:: max(1, len(points) // 16)])
+            geom_key = (
+                round(float(mid[0]), 5),
+                round(float(mid[1]), 5),
+                round(float(mid[2]), 5),
+                round(peak, 5),
+            )
+        else:
+            geom_key = None
         if (
             len(points) == self._last_path_len
             and self._path_actor is not None
             and radius_key == self._last_path_radius_key
+            and geom_key == self._last_path_geom_key
         ):
             return
         if self._path_actor is not None:
@@ -1007,6 +1051,7 @@ class GlobeRenderer:
         poly = _path_polydata(points)
         self._last_path_len = len(points)
         self._last_path_radius_key = radius_key
+        self._last_path_geom_key = geom_key
         if poly is None:
             return
         tube = poly.tube(radius=radius, n_sides=12)
@@ -1203,18 +1248,18 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
     # Overview: only endpoints — every stop logo on the full route is visual noise.
     overview_markers = [0] if len(positions) == 1 else [0, len(positions) - 1]
 
-    # Pull back only far enough to frame the full route; drop mosaic so LODs match.
+    # Pull back and flatten arches → straight surface segments for a clear overview.
     for f in range(ZOOM_OUT_FRAMES):
         t = _ease_in_out(1.0 if ZOOM_OUT_FRAMES <= 1 else (f + 1) / ZOOM_OUT_FRAMES)
         dist = tracking_dist + t * (overview_dist - tracking_dist)
         focus_lat, focus_lng = xyz_to_ll(slerp(last_xyz, center_xyz, t))
-        # Crossfade: mosaic off once past DETAIL_DIST_MAX.
+        arch_scale = 1.0 - t
         states.append(
             _FrameState(
                 focus_lat=focus_lat,
                 focus_lng=focus_lng,
                 distance=dist,
-                path_points=list(completed_path),
+                path_points=journey_path_xyz(positions, arch_scale=arch_scale),
                 marker_indices=overview_markers,
                 traveler=None,
                 pitch=1.0 - t,
@@ -1222,13 +1267,14 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
             )
         )
 
+    flat_path = journey_path_xyz(positions, arch_scale=0.0)
     for _ in range(OUTRO_HOLD):
         states.append(
             _FrameState(
                 focus_lat=center_lat,
                 focus_lng=center_lng,
                 distance=overview_dist,
-                path_points=list(completed_path),
+                path_points=flat_path,
                 marker_indices=overview_markers,
                 traveler=None,
                 pitch=0.0,

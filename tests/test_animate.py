@@ -403,6 +403,39 @@ def test_build_frame_states_outro_shows_full_route():
     assert all(s.marker_indices == [0, 1] for s in states[outro_start:])
 
 
+def test_zoom_out_flattens_path_arches():
+    import numpy as np
+
+    positions = [
+        Position(date="a", lat=45.5, lng=13.6, days=1),
+        Position(date="b", lat=43.5, lng=16.4, days=1),
+    ]
+    states = build_frame_states(positions)
+    outro_start = len(states) - OUTRO_HOLD - ZOOM_OUT_FRAMES
+    zoom_out = states[outro_start : outro_start + ZOOM_OUT_FRAMES]
+
+    def max_radius(pts):
+        return max(float(np.linalg.norm(p)) for p in pts)
+
+    # Start of pullback still has flight lift; end / outro sit on the surface.
+    assert max_radius(zoom_out[0].path_points) > PATH_RADIUS_R + 0.005
+    assert max_radius(zoom_out[-1].path_points) == pytest.approx(PATH_RADIUS_R, abs=1e-6)
+    assert max_radius(states[-1].path_points) == pytest.approx(PATH_RADIUS_R, abs=1e-6)
+    # Midpoint should be between arched and flat.
+    mid_r = max_radius(zoom_out[len(zoom_out) // 2].path_points)
+    assert PATH_RADIUS_R < mid_r < max_radius(zoom_out[0].path_points)
+
+
+def test_great_circle_arch_scale_zero_is_flat():
+    import numpy as np
+
+    arched = great_circle_arch_xyz(45.0, 13.0, 43.5, 16.4, 17, arch_scale=1.0)
+    flat = great_circle_arch_xyz(45.0, 13.0, 43.5, 16.4, 17, arch_scale=0.0)
+    assert len(arched) == len(flat)
+    assert float(np.linalg.norm(arched[8])) > PATH_RADIUS_R + 0.01
+    assert all(abs(float(np.linalg.norm(p)) - PATH_RADIUS_R) < 1e-9 for p in flat)
+
+
 def test_overview_markers_are_endpoints_only():
     positions = [
         Position(date="a", lat=45.0, lng=13.0, days=1),
