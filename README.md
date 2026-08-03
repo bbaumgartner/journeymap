@@ -2,7 +2,7 @@
 
 Renders an animated 3D journey-map MP4 from Logseq journal `current-position:: lat, lng` entries, or from a hand-authored positions JSON file.
 
-https://github.com/user-attachments/assets/54ec6b1b-7dfa-4af3-87d9-cfba8187cc38
+https://github.com/user-attachments/assets/d7109f6a-c1f9-47cd-bc60-ea9dd386e9e1
 
 ## Setup
 
