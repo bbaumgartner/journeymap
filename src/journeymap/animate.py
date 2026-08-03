@@ -65,16 +65,22 @@ CAM_DIST_WIDE = 3.6
 # Narrower close range → less per-leg zoom pumping.
 CAM_DIST_CLOSE_MIN = 1.05
 CAM_DIST_CLOSE_MAX = 1.20
+# Dense local clusters may pull in past CAM_DIST_CLOSE_MIN.
+CAM_DIST_CLUSTER_MIN = 1.022
 # Frame each leg so its angular span fills ~1/margin of the viewport.
 CLOSE_SPAN_MARGIN = 5.0
 # Never tighter than this FOV diameter (keeps sub-0.1° GPS jitter usable).
 CLOSE_MIN_FOV_DEG = 1.4
+# Local cluster: zoom so nearby stops don't stack under overlapping logos.
+CLUSTER_RADIUS_DEG = 0.85
+CLUSTER_MIN_COUNT = 3
+MARKER_SEPARATION_PX = 60  # target on-screen gap between nearest neighbors
 # Overview zoom: frame the journey mosaic tightly (not a full-globe pullback).
 OVERVIEW_FRAME_MARGIN = 1.02
 OVERVIEW_MIN_HALF_DEG = 1.8
 CAMERA_VFOV_DEG = 30.0
 LOOK_AHEAD = 0.0  # camera tracks the traveler exactly (look-ahead caused focus jumps)
-PITCH_OFFSET_DEG = 2.5
+PITCH_OFFSET_DEG = 0.9  # mild oblique; keep close-ups mostly eagle-eye
 MAX_TILES = 200
 TILE_ZOOM_MIN = 4
 TILE_ZOOM_MAX = 13
@@ -157,19 +163,125 @@ def journey_span_deg(positions: list[Position]) -> float:
     return span
 
 
-def close_camera_distance_for_span(span_deg: float) -> float:
+def close_camera_distance_for_span(
+    span_deg: float,
+    *,
+    dist_min: float = CAM_DIST_CLOSE_MIN,
+    dist_max: float = CAM_DIST_CLOSE_MAX,
+) -> float:
     """Camera distance that frames ``span_deg`` with margin (closer for short hops)."""
     fov = max(CLOSE_MIN_FOV_DEG, max(0.0, span_deg) * CLOSE_SPAN_MARGIN)
     half_deg = fov / 2.0
-    # Past ~half the camera VFOV the altitude model blows up; use the far clamp.
+    return _camera_distance_for_half_angle(half_deg, dist_min=dist_min, dist_max=dist_max)
+
+
+def _camera_distance_for_half_angle(
+    half_deg: float,
+    *,
+    dist_min: float,
+    dist_max: float,
+) -> float:
+    """Map an on-sphere half-FOV (degrees) to a camera distance clamp."""
+    half_deg = max(0.05, half_deg)
     half_cap = CAMERA_VFOV_DEG / 2.0 * 0.98
     if half_deg >= half_cap:
-        return CAM_DIST_CLOSE_MAX
+        return dist_max
     half_rad = math.radians(half_deg)
     half_vfov = math.radians(CAMERA_VFOV_DEG / 2.0)
     altitude = math.tan(half_rad) / math.tan(half_vfov)
     dist = EARTH_RADIUS + altitude
-    return max(CAM_DIST_CLOSE_MIN, min(CAM_DIST_CLOSE_MAX, dist))
+    return max(dist_min, min(dist_max, dist))
+
+
+def local_cluster_positions(
+    positions: list[Position],
+    focus_idx: int,
+    *,
+    radius_deg: float = CLUSTER_RADIUS_DEG,
+) -> list[Position]:
+    """Stops within ``radius_deg`` of ``positions[focus_idx]`` (inclusive)."""
+    if focus_idx < 0 or focus_idx >= len(positions):
+        return []
+    focus = positions[focus_idx]
+    return [
+        p
+        for p in positions
+        if angular_distance_deg(focus.lat, focus.lng, p.lat, p.lng) <= radius_deg
+    ]
+
+
+def median_nearest_neighbor_deg(positions: list[Position]) -> float:
+    """Median nearest-neighbor angular separation; 0 if fewer than 2 stops."""
+    if len(positions) < 2:
+        return 0.0
+    nn: list[float] = []
+    for i, a in enumerate(positions):
+        best = min(
+            angular_distance_deg(a.lat, a.lng, b.lat, b.lng)
+            for j, b in enumerate(positions)
+            if j != i
+        )
+        nn.append(best)
+    nn.sort()
+    return nn[len(nn) // 2]
+
+
+def close_camera_distance_for_cluster(
+    positions: list[Position],
+    focus_idx: int,
+) -> float | None:
+    """Tighter camera distance when many stops cluster around ``focus_idx``.
+
+    Frames the local cluster span with a margin that shrinks as membership
+    grows, so Dalmatia-style hop-scotch pulls in further than a lone pair.
+    Returns ``None`` when the local cluster is too small to need extra zoom.
+    """
+    cluster = local_cluster_positions(positions, focus_idx)
+    n = len(cluster)
+    if n < CLUSTER_MIN_COUNT:
+        return None
+    span = 0.0
+    for i, a in enumerate(cluster):
+        for b in cluster[i + 1 :]:
+            span = max(span, angular_distance_deg(a.lat, a.lng, b.lat, b.lng))
+    span = max(span, 0.05)
+    # Lone pairs use CLOSE_SPAN_MARGIN (~5); dense clusters tighten toward ~1.2.
+    margin = max(1.2, CLOSE_SPAN_MARGIN * (2.0 / n))
+    half_from_span = (span * margin) / 2.0
+    # Also try to keep typical spacing readable as separate logos. Floor the
+    # nearest-neighbor by mean spacing so near-duplicates don't over-zoom.
+    mean_sep = span / max(1, n - 1)
+    med_sep = max(median_nearest_neighbor_deg(cluster), mean_sep * 0.65)
+    half_from_markers = med_sep * IMG_HEIGHT / (2.0 * MARKER_SEPARATION_PX)
+    # Prefer the tighter of the two, but never wider than framing the cluster.
+    half_deg = min(half_from_span, max(half_from_markers, span * 0.55))
+    return _camera_distance_for_half_angle(
+        half_deg,
+        dist_min=CAM_DIST_CLUSTER_MIN,
+        dist_max=CAM_DIST_CLOSE_MAX,
+    )
+
+
+def close_camera_distance_for_leg(positions: list[Position], leg_index: int) -> float:
+    """Camera distance for the leg from ``positions[leg_index]`` → next stop.
+
+    Uses the leg span, then pulls in further if either endpoint sits in a
+    dense local cluster (e.g. Dalmatia hop-scotch).
+    """
+    if leg_index < 0 or leg_index >= len(positions) - 1:
+        return CAM_DIST_CLOSE_MIN
+    a, b = positions[leg_index], positions[leg_index + 1]
+    base = close_camera_distance_for_span(
+        angular_distance_deg(a.lat, a.lng, b.lat, b.lng)
+    )
+    cluster_dist: float | None = None
+    for idx in (leg_index, leg_index + 1):
+        d = close_camera_distance_for_cluster(positions, idx)
+        if d is not None:
+            cluster_dist = d if cluster_dist is None else min(cluster_dist, d)
+    if cluster_dist is None:
+        return base
+    return min(base, cluster_dist)
 
 
 def close_camera_distance(positions: list[Position]) -> float:
@@ -1170,14 +1282,7 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
     overview_dist = overview_camera_distance(positions)
     center_lat, center_lng = journey_center(positions)
     leg_dists = [
-        close_camera_distance_for_span(
-            angular_distance_deg(
-                positions[i].lat,
-                positions[i].lng,
-                positions[i + 1].lat,
-                positions[i + 1].lng,
-            )
-        )
+        close_camera_distance_for_leg(positions, i)
         for i in range(len(positions) - 1)
     ]
     # Intro lands on the first leg's framing; single-stop journeys stay tight.

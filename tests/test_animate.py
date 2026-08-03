@@ -340,6 +340,54 @@ def test_close_camera_distance_for_span_pulls_in_for_short_hops():
     assert CAM_DIST_CLOSE_MIN <= close_camera_distance_for_span(0.05) <= CAM_DIST_CLOSE_MAX
 
 
+def test_dense_cluster_zooms_tighter_than_sparse_pair():
+    from journeymap.animate import (
+        CAM_DIST_CLUSTER_MIN,
+        close_camera_distance_for_cluster,
+        close_camera_distance_for_leg,
+    )
+
+    pair = [
+        Position(date="a", lat=43.50, lng=15.90, days=1),
+        Position(date="b", lat=43.55, lng=15.95, days=1),
+    ]
+    # 8 stops packed in ~0.15° — Dalmatia-style.
+    dense = [
+        Position(date=f"p{i}", lat=43.50 + 0.04 * (i % 3), lng=15.90 + 0.04 * (i // 3), days=1)
+        for i in range(8)
+    ]
+    assert close_camera_distance_for_cluster(pair, 0) is None
+    assert close_camera_distance_for_leg(pair, 0) == pytest.approx(
+        close_camera_distance_for_span(
+            angular_distance_deg(pair[0].lat, pair[0].lng, pair[1].lat, pair[1].lng)
+        )
+    )
+    cluster_dist = close_camera_distance_for_cluster(dense, 3)
+    assert cluster_dist is not None
+    assert cluster_dist < CAM_DIST_CLOSE_MIN
+    assert cluster_dist >= CAM_DIST_CLUSTER_MIN
+    assert close_camera_distance_for_leg(dense, 3) < close_camera_distance_for_leg(pair, 0)
+
+
+def test_larger_cluster_zooms_tighter_than_small_cluster():
+    from journeymap.animate import close_camera_distance_for_cluster
+
+    # Same ~0.6° span, different membership — denser should pull in more.
+    small = [
+        Position(date="s0", lat=44.00, lng=15.00, days=1),
+        Position(date="s1", lat=44.30, lng=15.00, days=1),
+        Position(date="s2", lat=44.60, lng=15.00, days=1),
+    ]
+    large = [
+        Position(date=f"l{i}", lat=44.00 + 0.085 * i, lng=15.00, days=1) for i in range(8)
+    ]
+    d_small = close_camera_distance_for_cluster(small, 1)
+    d_large = close_camera_distance_for_cluster(large, 3)
+    assert d_small is not None and d_large is not None
+    assert d_large < d_small
+    assert d_small > d_large + 0.01
+
+
 def test_build_frame_states_single():
     positions = [Position(date="a", lat=45.0, lng=13.0, days=5)]
     states = build_frame_states(positions)
