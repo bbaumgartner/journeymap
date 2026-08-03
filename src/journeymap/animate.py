@@ -48,24 +48,27 @@ PATH_COLOR = (0, 130, 210)
 PATH_RADIUS = 0.0007
 PATH_REF_DISTANCE = 1.12
 PATH_RADIUS_MIN = 0.00008
-PATH_RADIUS_MAX = 0.0025
+PATH_RADIUS_MAX = 0.0016
 EARTH_RADIUS = 1.0
 TILE_RADIUS = 1.0015
 PATH_RADIUS_R = 1.003
 # Great-circle legs lift into a sine arch (flight-path style).
-PATH_ARCH_BASE = 0.012
-PATH_ARCH_PER_DEG = 0.001
-PATH_ARCH_MAX = 0.08
+# Peak scales with leg length; tiny hops stay flat so coastal zigzags don't loop.
+PATH_ARCH_BASE = 0.003
+PATH_ARCH_PER_DEG = 0.0018
+PATH_ARCH_MAX = 0.05
+PATH_ARCH_FLAT_DEG = 0.15  # below this, no fixed base lift
 # Camera distance from Earth centre (larger = farther / zoomed out).
 CAM_DIST_WIDE = 3.6
-CAM_DIST_CLOSE_MIN = 1.03
-CAM_DIST_CLOSE_MAX = 1.28
+# Narrower close range → less per-leg zoom pumping.
+CAM_DIST_CLOSE_MIN = 1.05
+CAM_DIST_CLOSE_MAX = 1.20
 # Frame each leg so its angular span fills ~1/margin of the viewport.
 CLOSE_SPAN_MARGIN = 5.0
 # Never tighter than this FOV diameter (keeps sub-0.1° GPS jitter usable).
-CLOSE_MIN_FOV_DEG = 1.2
+CLOSE_MIN_FOV_DEG = 1.4
 # Overview zoom: frame the journey mosaic tightly (not a full-globe pullback).
-OVERVIEW_FRAME_MARGIN = 1.08
+OVERVIEW_FRAME_MARGIN = 1.02
 OVERVIEW_MIN_HALF_DEG = 1.8
 CAMERA_VFOV_DEG = 30.0
 LOOK_AHEAD = 0.0  # camera tracks the traveler exactly (look-ahead caused focus jumps)
@@ -74,17 +77,20 @@ MAX_TILES = 96
 TILE_ZOOM_MIN = 4
 TILE_ZOOM_MAX = 13
 # Low-z OSM mosaic → equirect bake for the full-globe base texture.
-WORLD_TILE_ZOOM = 3
-WORLD_EQUIRECT_WIDTH = 2048
-WORLD_EQUIRECT_HEIGHT = 1024
-# Journey mosaic stays up through the route-overview outro.
-DETAIL_DIST_MAX = 3.0
-# When closer than this, drape a local high-z mosaic over the journey tiles.
-LOCAL_DETAIL_MAX_DIST = 1.12
+# z=4 is sharper so overview (no journey mosaic) doesn't look blotchy.
+WORLD_TILE_ZOOM = 4
+WORLD_EQUIRECT_WIDTH = 4096
+WORLD_EQUIRECT_HEIGHT = 2048
+# Journey mosaic for close tracking only — hide before overview so LODs don't clash.
+DETAIL_DIST_MAX = 1.35
+# Local high-z overlay disabled: mixed LODs against the journey mosaic looked worse.
+LOCAL_DETAIL_MAX_DIST = 0.0
 LOCAL_DETAIL_RADIUS = 1.0028
 # Padding around the journey bbox when building the fixed detail mosaic.
-JOURNEY_PAD_DEG = 1.2
-JOURNEY_PAD_FRAC = 0.45
+JOURNEY_PAD_DEG = 1.5
+JOURNEY_PAD_FRAC = 0.55
+# Skip flight arches for hops shorter than this (draw a short surface segment instead).
+MIN_ARCH_LEG_DEG = 0.35
 # Logo markers track the on-screen path width (not days-based size).
 MARKER_PATH_SCALE = 5.0
 MARKER_SIZE_MIN = 24
@@ -304,8 +310,15 @@ def great_circle_points(
 
 
 def path_arch_peak(angular_deg: float) -> float:
-    """Peak radial lift above ``PATH_RADIUS_R`` for a leg of the given length."""
-    peak = PATH_ARCH_BASE + PATH_ARCH_PER_DEG * max(0.0, angular_deg)
+    """Peak radial lift above ``PATH_RADIUS_R`` for a leg of the given length.
+
+    Longer legs get a flight-style arch; sub-``PATH_ARCH_FLAT_DEG`` hops stay
+    nearly flat so dense coastal revisits don't turn into scribble loops.
+    """
+    ang = max(0.0, angular_deg)
+    if ang < PATH_ARCH_FLAT_DEG:
+        return min(PATH_ARCH_MAX, PATH_ARCH_PER_DEG * ang)
+    peak = PATH_ARCH_BASE + PATH_ARCH_PER_DEG * ang
     return min(PATH_ARCH_MAX, peak)
 
 
@@ -316,12 +329,23 @@ def great_circle_arch_xyz(
     lng2: float,
     n: int,
 ) -> list[np.ndarray]:
-    """Sample ``n`` XYZ points along a great-circle flight arch (sine lift)."""
+    """Sample ``n`` XYZ points along a great-circle flight arch (sine lift).
+
+    Legs shorter than ``MIN_ARCH_LEG_DEG`` stay on the surface so dense coastal
+    revisits don't dominate the route with tiny scribble loops.
+    """
     if n < 2:
         return [ll_to_xyz(lat1, lng1, PATH_RADIUS_R)]
     a = ll_to_xyz(lat1, lng1)
     b = ll_to_xyz(lat2, lng2)
-    peak = path_arch_peak(angular_distance_deg(lat1, lng1, lat2, lng2))
+    ang = angular_distance_deg(lat1, lng1, lat2, lng2)
+    if ang < MIN_ARCH_LEG_DEG:
+        # Short hop: few surface samples, no arch.
+        n_short = max(2, min(n, 8))
+        return [
+            slerp(a, b, i / (n_short - 1)) * PATH_RADIUS_R for i in range(n_short)
+        ]
+    peak = path_arch_peak(ang)
     out: list[np.ndarray] = []
     for i in range(n):
         t = i / (n - 1)
@@ -349,7 +373,10 @@ def _camera_basis(lat: float, lng: float) -> tuple[np.ndarray, np.ndarray, np.nd
 
 
 def apply_camera_pitch(lat: float, lng: float, pitch_deg: float = PITCH_OFFSET_DEG) -> tuple[float, float]:
-    """Shift look-at north of ``(lat, lng)`` for a slight orbital tilt."""
+    """Legacy helper: geographic point north of ``(lat, lng)`` by ``pitch_deg``.
+
+    Prefer ``_camera_pose``, which orbits the camera and keeps the focus fixed.
+    """
     if abs(pitch_deg) < 1e-9:
         return lat, lng
     _east, north, forward = _camera_basis(lat, lng)
@@ -357,6 +384,32 @@ def apply_camera_pitch(lat: float, lng: float, pitch_deg: float = PITCH_OFFSET_D
     tilted = math.cos(angle) * forward + math.sin(angle) * north
     tilted /= np.linalg.norm(tilted)
     return xyz_to_ll(tilted)
+
+
+def _camera_pose(
+    focus_lat: float,
+    focus_lng: float,
+    distance: float,
+    *,
+    pitch: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return (position, focal_point, view_up) for PyVista.
+
+    ``pitch`` is 0..1. The focal point stays on ``(focus_lat, focus_lng)``;
+    the camera orbits slightly south so the view is mildly oblique without
+    sliding the zoom target hundreds of km north.
+    """
+    pitch = min(1.0, max(0.0, pitch))
+    _east, north, forward = _camera_basis(focus_lat, focus_lng)
+    focal = forward * EARTH_RADIUS
+    angle = math.radians(PITCH_OFFSET_DEG * pitch)
+    # Orbit camera south around local east: nadir moves south, look-at stays put.
+    cam_dir = math.cos(angle) * forward - math.sin(angle) * north
+    cam_dir = cam_dir / np.linalg.norm(cam_dir)
+    position = cam_dir * distance
+    # Keep horizon-up stable (local north at the focus).
+    view_up = north
+    return position, focal, view_up
 
 
 # ---- OSM tiles -------------------------------------------------------------
@@ -730,31 +783,6 @@ def _path_polydata(points: list[np.ndarray]) -> pv.PolyData | None:
         return None
     xyz = np.asarray(points, dtype=np.float64)
     return pv.lines_from_points(xyz)
-
-
-def _camera_pose(
-    focus_lat: float,
-    focus_lng: float,
-    distance: float,
-    *,
-    pitch: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (position, focal_point, view_up) for PyVista.
-
-    ``pitch`` is 0..1, blending toward a mild northward look-at offset.
-    """
-    pitch = min(1.0, max(0.0, pitch))
-    if pitch > 1e-6:
-        max_pitch = min(PITCH_OFFSET_DEG, view_half_angle_deg(distance) * 0.35)
-        look_lat, look_lng = apply_camera_pitch(focus_lat, focus_lng, max_pitch * pitch)
-    else:
-        look_lat, look_lng = focus_lat, focus_lng
-    focal = ll_to_xyz(look_lat, look_lng, EARTH_RADIUS)
-    direction = focal / np.linalg.norm(focal)
-    position = direction * distance
-    _east, north, _fwd = _camera_basis(look_lat, look_lng)
-    view_up = north
-    return position, focal, view_up
 
 
 def world_to_pixel(
@@ -1145,23 +1173,25 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
     last = positions[-1]
     last_xyz = ll_to_xyz(last.lat, last.lng)
     center_xyz = ll_to_xyz(center_lat, center_lng)
+    # Overview: only endpoints — every stop logo on the full route is visual noise.
+    overview_markers = [0] if len(positions) == 1 else [0, len(positions) - 1]
 
-    # Pull back only far enough to frame the full route on the tile mosaic.
+    # Pull back only far enough to frame the full route; drop mosaic so LODs match.
     for f in range(ZOOM_OUT_FRAMES):
         t = _ease_in_out(1.0 if ZOOM_OUT_FRAMES <= 1 else (f + 1) / ZOOM_OUT_FRAMES)
         dist = tracking_dist + t * (overview_dist - tracking_dist)
         focus_lat, focus_lng = xyz_to_ll(slerp(last_xyz, center_xyz, t))
+        # Crossfade: mosaic off once past DETAIL_DIST_MAX.
         states.append(
             _FrameState(
                 focus_lat=focus_lat,
                 focus_lng=focus_lng,
                 distance=dist,
                 path_points=list(completed_path),
-                marker_indices=list(range(len(positions))),
+                marker_indices=overview_markers,
                 traveler=None,
-                # Drop pitch so the mosaic (not empty space) fills the frame.
                 pitch=1.0 - t,
-                use_detail=True,
+                use_detail=dist <= DETAIL_DIST_MAX,
             )
         )
 
@@ -1172,10 +1202,10 @@ def build_frame_states(positions: list[Position]) -> list[_FrameState]:
                 focus_lng=center_lng,
                 distance=overview_dist,
                 path_points=list(completed_path),
-                marker_indices=list(range(len(positions))),
+                marker_indices=overview_markers,
                 traveler=None,
                 pitch=0.0,
-                use_detail=True,
+                use_detail=False,
             )
         )
     return states

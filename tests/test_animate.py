@@ -114,9 +114,12 @@ def test_great_circle_midpoint_roughly_halfway():
 
 
 def test_path_arch_peak_scales_and_caps():
-    assert path_arch_peak(0.0) > 0.0
+    assert path_arch_peak(0.0) == 0.0
+    assert path_arch_peak(0.05) < path_arch_peak(2.0)
     assert path_arch_peak(40.0) > path_arch_peak(5.0)
     assert path_arch_peak(1e6) == PATH_ARCH_MAX
+    # Tiny hops must not get the fixed base lift (that made scribble loops).
+    assert path_arch_peak(0.05) < 0.001
 
 
 def test_great_circle_arch_lifts_midpoint():
@@ -129,7 +132,7 @@ def test_great_circle_arch_lifts_midpoint():
     r1 = float(np.linalg.norm(pts[-1]))
     assert abs(r0 - PATH_RADIUS_R) < 1e-9
     assert abs(r1 - PATH_RADIUS_R) < 1e-9
-    assert r_mid > r0 + 0.005
+    assert r_mid > r0 + 0.003
 
 
 def test_angular_distance_quarter():
@@ -247,6 +250,25 @@ def test_pitch_is_continuous_on_zoom():
         assert abs(b - a) < 0.25
 
 
+def test_camera_pose_keeps_focus_when_pitched():
+    """Pitch must orbit the camera, not slide the look-at hundreds of km north."""
+    from journeymap.animate import _camera_pose
+
+    lat, lng = 45.5127, 13.5954
+    _pos0, focal0, _up0 = _camera_pose(lat, lng, 1.1, pitch=0.0)
+    _pos1, focal1, _up1 = _camera_pose(lat, lng, 1.1, pitch=1.0)
+    f0_lat, f0_lng = xyz_to_ll(focal0)
+    f1_lat, f1_lng = xyz_to_ll(focal1)
+    assert abs(f0_lat - lat) < 1e-6
+    assert abs(f1_lat - lat) < 1e-6
+    assert abs(((f0_lng - lng + 180) % 360) - 180) < 1e-6
+    assert abs(((f1_lng - lng + 180) % 360) - 180) < 1e-6
+    # Camera should move when pitched (oblique), but focus stays put.
+    import numpy as np
+
+    assert np.linalg.norm(_pos1 - _pos0) > 1e-4
+
+
 def test_osm_zoom_closer_is_higher():
     assert osm_zoom_for_distance(CAM_DIST_CLOSE_MIN) >= osm_zoom_for_distance(1.5)
 
@@ -335,14 +357,26 @@ def test_build_frame_states_outro_shows_full_route():
     assert overview < CAM_DIST_WIDE * 0.55
     assert overview >= close_camera_distance(positions)
     assert states[-1].marker_indices == [0, 1]
-    assert states[-1].use_detail is True
+    assert states[-1].use_detail is False
     assert len(states[-1].path_points) >= 2
     # Zoom-out segment increases distance toward overview (not full globe).
     outro_start = len(states) - OUTRO_HOLD - ZOOM_OUT_FRAMES
     dists = [s.distance for s in states[outro_start : outro_start + ZOOM_OUT_FRAMES]]
     assert dists[0] <= dists[-1]
     assert dists[-1] == pytest.approx(overview)
-    assert all(s.use_detail for s in states[outro_start:])
+    assert states[-1].use_detail is False
+    assert all(s.marker_indices == [0, 1] for s in states[outro_start:])
+
+
+def test_overview_markers_are_endpoints_only():
+    positions = [
+        Position(date="a", lat=45.0, lng=13.0, days=1),
+        Position(date="b", lat=44.0, lng=14.0, days=1),
+        Position(date="c", lat=43.0, lng=15.0, days=1),
+        Position(date="d", lat=42.0, lng=16.0, days=1),
+    ]
+    states = build_frame_states(positions)
+    assert states[-1].marker_indices == [0, 3]
 
 
 def test_overview_camera_distance_fits_route_not_globe():
