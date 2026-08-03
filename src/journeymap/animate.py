@@ -52,12 +52,14 @@ PATH_RADIUS_MAX = 0.0016
 EARTH_RADIUS = 1.0
 TILE_RADIUS = 1.0015
 PATH_RADIUS_R = 1.003
-# Great-circle legs lift into a sine arch (flight-path style).
-# Peak scales with leg length; tiny hops stay flat so coastal zigzags don't loop.
-PATH_ARCH_BASE = 0.003
-PATH_ARCH_PER_DEG = 0.0018
-PATH_ARCH_MAX = 0.05
-PATH_ARCH_FLAT_DEG = 0.15  # below this, no fixed base lift
+# Great-circle legs lift into a flight-style arch.
+# Peak scales with chord length; short hops stay on the surface.
+PATH_ARCH_FRAC = 0.42  # peak as a fraction of unit-sphere chord length
+PATH_ARCH_MAX = 0.055
+PATH_LATERAL_FRAC = 0.14  # sideways bow (visible from above); fraction of chord
+PATH_ARCH_FLAT_DEG = 0.2  # below this, peak ramps to zero
+# Skip flight arches for hops shorter than this (draw a short surface segment).
+MIN_ARCH_LEG_DEG = 0.4
 # Camera distance from Earth centre (larger = farther / zoomed out).
 CAM_DIST_WIDE = 3.6
 # Narrower close range → less per-leg zoom pumping.
@@ -89,8 +91,6 @@ LOCAL_DETAIL_RADIUS = 1.0028
 # Padding around the journey bbox when building the fixed detail mosaic.
 JOURNEY_PAD_DEG = 1.5
 JOURNEY_PAD_FRAC = 0.55
-# Skip flight arches for hops shorter than this (draw a short surface segment instead).
-MIN_ARCH_LEG_DEG = 0.35
 # Logo markers track the on-screen path width (not days-based size).
 MARKER_PATH_SCALE = 5.0
 MARKER_SIZE_MIN = 24
@@ -312,14 +312,27 @@ def great_circle_points(
 def path_arch_peak(angular_deg: float) -> float:
     """Peak radial lift above ``PATH_RADIUS_R`` for a leg of the given length.
 
-    Longer legs get a flight-style arch; sub-``PATH_ARCH_FLAT_DEG`` hops stay
-    nearly flat so dense coastal revisits don't turn into scribble loops.
+    Scales with great-circle chord length so short hops stay flat and longer
+    legs get a clear flight-style arch.
     """
-    ang = max(0.0, angular_deg)
+    ang = min(180.0, max(0.0, angular_deg))
+    half = math.radians(ang) / 2.0
+    chord = 2.0 * math.sin(half)
+    peak = PATH_ARCH_FRAC * chord
     if ang < PATH_ARCH_FLAT_DEG:
-        return min(PATH_ARCH_MAX, PATH_ARCH_PER_DEG * ang)
-    peak = PATH_ARCH_BASE + PATH_ARCH_PER_DEG * ang
+        t = ang / PATH_ARCH_FLAT_DEG
+        peak *= t * t
     return min(PATH_ARCH_MAX, peak)
+
+
+def path_lateral_peak(angular_deg: float) -> float:
+    """Sideways bow amplitude so arches read as curves from a top-down view."""
+    ang = min(180.0, max(0.0, angular_deg))
+    if ang < MIN_ARCH_LEG_DEG:
+        return 0.0
+    half = math.radians(ang) / 2.0
+    chord = 2.0 * math.sin(half)
+    return min(PATH_ARCH_MAX, PATH_LATERAL_FRAC * chord)
 
 
 def great_circle_arch_xyz(
@@ -329,10 +342,11 @@ def great_circle_arch_xyz(
     lng2: float,
     n: int,
 ) -> list[np.ndarray]:
-    """Sample ``n`` XYZ points along a great-circle flight arch (sine lift).
+    """Sample ``n`` XYZ points along a great-circle flight arch.
 
-    Legs shorter than ``MIN_ARCH_LEG_DEG`` stay on the surface so dense coastal
-    revisits don't dominate the route with tiny scribble loops.
+    Combines radial sine lift with a mild out-of-plane bow. Legs shorter than
+    ``MIN_ARCH_LEG_DEG`` stay on the surface so dense coastal revisits don't
+    turn into scribble loops.
     """
     if n < 2:
         return [ll_to_xyz(lat1, lng1, PATH_RADIUS_R)]
@@ -340,19 +354,32 @@ def great_circle_arch_xyz(
     b = ll_to_xyz(lat2, lng2)
     ang = angular_distance_deg(lat1, lng1, lat2, lng2)
     if ang < MIN_ARCH_LEG_DEG:
-        # Short hop: few surface samples, no arch.
         n_short = max(2, min(n, 8))
         return [
             slerp(a, b, i / (n_short - 1)) * PATH_RADIUS_R for i in range(n_short)
         ]
     peak = path_arch_peak(ang)
+    lateral = path_lateral_peak(ang)
+    normal = np.cross(a, b)
+    nn = float(np.linalg.norm(normal))
+    if nn > 1e-12:
+        normal = normal / nn
+        # Keep bows on a consistent side (toward local north) so consecutive
+        # legs don't flip into an S-wave.
+        mid = slerp(a, b, 0.5)
+        _e, north, _f = _camera_basis(*xyz_to_ll(mid))
+        if float(np.dot(normal, north)) < 0.0:
+            normal = -normal
+    else:
+        normal = np.zeros(3, dtype=np.float64)
     out: list[np.ndarray] = []
     for i in range(n):
         t = i / (n - 1)
+        envelope = math.sin(math.pi * t)
         direction = slerp(a, b, t)
         direction = direction / np.linalg.norm(direction)
-        radius = PATH_RADIUS_R + peak * math.sin(math.pi * t)
-        out.append(direction * radius)
+        pt = direction * (PATH_RADIUS_R + peak * envelope) + normal * (lateral * envelope)
+        out.append(pt)
     return out
 
 

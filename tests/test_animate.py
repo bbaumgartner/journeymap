@@ -118,8 +118,10 @@ def test_path_arch_peak_scales_and_caps():
     assert path_arch_peak(0.05) < path_arch_peak(2.0)
     assert path_arch_peak(40.0) > path_arch_peak(5.0)
     assert path_arch_peak(1e6) == PATH_ARCH_MAX
-    # Tiny hops must not get the fixed base lift (that made scribble loops).
+    # Tiny hops must stay nearly flat.
     assert path_arch_peak(0.05) < 0.001
+    # Medium travel legs get a visible flight arch.
+    assert path_arch_peak(2.0) > 0.01
 
 
 def test_great_circle_arch_lifts_midpoint():
@@ -130,9 +132,42 @@ def test_great_circle_arch_lifts_midpoint():
     r0 = float(np.linalg.norm(pts[0]))
     r_mid = float(np.linalg.norm(pts[8]))
     r1 = float(np.linalg.norm(pts[-1]))
-    assert abs(r0 - PATH_RADIUS_R) < 1e-9
-    assert abs(r1 - PATH_RADIUS_R) < 1e-9
-    assert r_mid > r0 + 0.003
+    assert abs(r0 - PATH_RADIUS_R) < 1e-6
+    assert abs(r1 - PATH_RADIUS_R) < 1e-6
+    assert r_mid > r0 + 0.01
+
+
+def test_great_circle_arch_bows_laterally():
+    import numpy as np
+    from journeymap.animate import path_lateral_peak
+
+    assert path_lateral_peak(0.1) == 0.0
+    assert path_lateral_peak(2.0) > 0.0
+    a = ll_to_xyz(45.0, 13.0)
+    b = ll_to_xyz(43.5, 16.4)
+    normal = np.cross(a, b)
+    normal = normal / np.linalg.norm(normal)
+    pts = great_circle_arch_xyz(45.0, 13.0, 43.5, 16.4, 17)
+    # Midpoint should leave the great-circle plane (lateral bow).
+    mid = pts[8]
+    # Project out the radial part along slerp mid — residual along normal.
+    mid_dir = mid / np.linalg.norm(mid)
+    slerp_mid = slerp(a, b, 0.5)
+    slerp_mid = slerp_mid / np.linalg.norm(slerp_mid)
+    # Displacement from pure radial great-circle point.
+    pure = slerp_mid * PATH_RADIUS_R
+    offset = mid - pure
+    assert abs(float(np.dot(offset, normal))) > 0.002
+
+
+def test_great_circle_arch_short_hop_stays_flat():
+    import numpy as np
+
+    pts = great_circle_arch_xyz(43.57, 15.94, 43.59, 15.93, 17)
+    assert len(pts) <= 8
+    r0 = float(np.linalg.norm(pts[0]))
+    r_mid = float(np.linalg.norm(pts[len(pts) // 2]))
+    assert abs(r_mid - r0) < 1e-9
 
 
 def test_angular_distance_quarter():
