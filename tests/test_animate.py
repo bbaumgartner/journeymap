@@ -232,6 +232,22 @@ def test_visible_tiles_empty_when_far():
     assert visible_tiles(45.0, 13.0, DETAIL_DIST_MAX) == []
 
 
+def test_local_detail_opacity_fades_with_distance():
+    from journeymap.animate import (
+        LOCAL_DETAIL_FADE_END,
+        LOCAL_DETAIL_FADE_START,
+        local_detail_opacity_for_distance,
+    )
+
+    assert local_detail_opacity_for_distance(CAM_DIST_CLOSE_MIN) == 1.0
+    assert local_detail_opacity_for_distance(LOCAL_DETAIL_FADE_START) == 1.0
+    assert local_detail_opacity_for_distance(LOCAL_DETAIL_FADE_END) == 0.0
+    mid = local_detail_opacity_for_distance(
+        (LOCAL_DETAIL_FADE_START + LOCAL_DETAIL_FADE_END) / 2
+    )
+    assert 0.0 < mid < 1.0
+
+
 def test_visible_tiles_near_are_capped():
     from journeymap.animate import MAX_TILES
 

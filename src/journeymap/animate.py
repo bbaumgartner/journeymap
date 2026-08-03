@@ -93,9 +93,13 @@ WORLD_EQUIRECT_HEIGHT = 2048
 DETAIL_DIST_MAX = 1.40
 DETAIL_FADE_START = 1.22  # begin opacity fade (distance backup)
 DETAIL_FADE_END = DETAIL_DIST_MAX
-# Local high-z overlay disabled: mixed LODs against the journey mosaic looked worse.
-LOCAL_DETAIL_MAX_DIST = 0.0
+# Local high-z overlay when fully zoomed in (above the fixed journey mosaic).
+LOCAL_DETAIL_MAX_DIST = 1.10
+LOCAL_DETAIL_FADE_START = 1.055
+LOCAL_DETAIL_FADE_END = LOCAL_DETAIL_MAX_DIST
 LOCAL_DETAIL_RADIUS = 1.0028
+LOCAL_DETAIL_PAD = 1.25  # footprint vs FOV; keep edges mostly off-screen
+LOCAL_DETAIL_MAX_TILES = 96
 # Padding around the journey bbox when building the fixed detail mosaic.
 JOURNEY_PAD_DEG = 1.5
 JOURNEY_PAD_FRAC = 0.55
@@ -149,6 +153,18 @@ def detail_opacity_for_distance(distance: float) -> float:
     if distance >= DETAIL_FADE_END:
         return 0.0
     t = (distance - DETAIL_FADE_START) / (DETAIL_FADE_END - DETAIL_FADE_START)
+    return 1.0 - _ease_in_out(t)
+
+
+def local_detail_opacity_for_distance(distance: float) -> float:
+    """Fade the high-z local overlay before it hard-pops off."""
+    if distance <= LOCAL_DETAIL_FADE_START:
+        return 1.0
+    if distance >= LOCAL_DETAIL_FADE_END:
+        return 0.0
+    t = (distance - LOCAL_DETAIL_FADE_START) / (
+        LOCAL_DETAIL_FADE_END - LOCAL_DETAIL_FADE_START
+    )
     return 1.0 - _ease_in_out(t)
 
 
@@ -661,11 +677,12 @@ def visible_tiles(
     distance: float,
     *,
     max_tiles: int = MAX_TILES,
+    pad: float = 1.6,
 ) -> list[tuple[int, int, int]]:
-    """List ``(z, x, y)`` OSM tiles covering a footprint around focus (legacy helper)."""
+    """List ``(z, x, y)`` OSM tiles covering a footprint around focus."""
     if distance >= DETAIL_DIST_MAX:
         return []
-    half = view_half_angle_deg(distance) * 1.6
+    half = view_half_angle_deg(distance) * pad
     z = osm_zoom_for_distance(distance)
     while z >= TILE_ZOOM_MIN:
         lat_min = max(-85.0, focus_lat - half)
@@ -1024,6 +1041,7 @@ class GlobeRenderer:
         self._local_actor = None
         self._local_key: tuple[int, int, int, int, int] | None = None
         self._local_visible = False
+        self._local_opacity = 1.0
         self._path_actor = None
         self._last_path_len = -1
         self._last_path_radius_key = -1.0
@@ -1079,6 +1097,7 @@ class GlobeRenderer:
             self._local_actor = None
         self._local_key = None
         self._local_visible = False
+        self._local_opacity = 1.0
 
     def _set_local_visible(self, visible: bool) -> None:
         if self._local_actor is None:
@@ -1093,10 +1112,17 @@ class GlobeRenderer:
         self, focus_lat: float, focus_lng: float, distance: float
     ) -> None:
         """Drape a sharper local mosaic when the camera is closer than the journey tiles."""
-        if distance > LOCAL_DETAIL_MAX_DIST:
+        opacity = local_detail_opacity_for_distance(distance)
+        if opacity <= 1e-3:
             self._set_local_visible(False)
             return
-        tiles = visible_tiles(focus_lat, focus_lng, distance)
+        tiles = visible_tiles(
+            focus_lat,
+            focus_lng,
+            distance,
+            max_tiles=LOCAL_DETAIL_MAX_TILES,
+            pad=LOCAL_DETAIL_PAD,
+        )
         if not tiles:
             self._set_local_visible(False)
             return
@@ -1109,6 +1135,9 @@ class GlobeRenderer:
         key = (z, min(xs), max(xs), min(ys), max(ys))
         if key == self._local_key and self._local_actor is not None:
             self._set_local_visible(True)
+            if opacity != self._local_opacity:
+                self._local_actor.GetProperty().SetOpacity(opacity)
+                self._local_opacity = opacity
             return
         mosaic = _mosaic_from_tiles(tiles, self.tile_fetcher)
         if mosaic is None:
@@ -1128,9 +1157,11 @@ class GlobeRenderer:
             ambient=1.0,
             diffuse=0.0,
             specular=0.0,
+            opacity=opacity,
         )
         self._local_key = key
         self._local_visible = True
+        self._local_opacity = opacity
 
     def _set_detail_visible(self, visible: bool, opacity: float = 1.0) -> None:
         if not self._detail_ready or self._detail_actor is None:
